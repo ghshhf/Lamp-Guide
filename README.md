@@ -88,16 +88,6 @@ go build -trimpath -ldflags="-H=windowsgui" -o LampGuide.exe .
 | `web` | 桌面页面、主题样式与 SVG 图标 |
 | `packaging`、`tools` | 安装向导、品牌资源及发布构建脚本 |
 
-## 支持项目
-
-如果 Lamp Guide 对你有帮助，欢迎自愿赞赏，支持后续开发与维护。
-
-使用微信扫描下方赞赏码，感谢支持。
-
-<p align="center">
-  <img src="docs/assets/wechat-appreciation.jpg" width="280" alt="FFEE 的微信赞赏码">
-</p>
-
 ## 来源与许可
 
 本项目是 **[LAGcomcom/zen-gate](https://github.com/LAGcomcom/zen-gate) 的桌面重构与扩展**，保留原作者与上游许可声明。渠道协议实现参考了 [dsh-our-free-model](https://github.com/Ebony-Vinyl/dsh-our-free-model)；内嵌 QoderCN 网关来源于 [qodercn-gateway](https://github.com/Morpheus799/qodercn-gateway)。
