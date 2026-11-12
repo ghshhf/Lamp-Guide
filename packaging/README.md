@@ -1,6 +1,6 @@
 # Lamp Guide Windows 安装包
 
-当前产品版本：1.2.3。目标：Windows 10 / 11 x64，当前用户安装。
+当前产品版本：1.2.4。目标：Windows 10 / 11 x64，当前用户安装。
 
 ## 安装流程
 
@@ -20,10 +20,10 @@
 构建脚本默认从 `_refs/build-tools/` 找工具和 WebView2，也可传参数：
 
 ```powershell
-.\tools\build-release.ps1 -Version 1.2.3 -Iscc 'C:\path\ISCC.exe' -Winres 'C:\path\go-winres.exe' -RuntimeInstaller 'C:\path\MicrosoftEdgeWebView2RuntimeInstallerX64.exe'
+.\tools\build-release.ps1 -Version 1.2.4 -Iscc 'C:\path\ISCC.exe' -Winres 'C:\path\go-winres.exe' -RuntimeInstaller 'C:\path\MicrosoftEdgeWebView2RuntimeInstallerX64.exe'
 ```
 
-输出：`dist/LampGuide-Setup-1.2.3-win-x64.exe` 及 SHA-256 校验文件。
+输出：`dist/LampGuide-Setup-1.2.4-win-x64.exe` 及 SHA-256 校验文件。
 脚本仅打包 `dist/app/` 中明确列出的程序、说明、第三方声明和品牌资源，不读取用户配置。
 
 推送或打开 PR 时，GitHub Actions 会运行测试并直接构建带图标、版本资源和版本号的 `LampGuide-<版本>-win-x64.exe` 与 `.sha256`，作为构建产物上传；打 `v*` 标签时另外发布到 Releases，供应用内一键更新使用。安装包仍需本地构建（依赖 Inno Setup 6 与带微软签名的 WebView2 离线安装器）。版本号以 `packaging/winres.json` 的 `fixed.file_version` 为准。

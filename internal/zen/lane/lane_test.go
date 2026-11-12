@@ -704,3 +704,22 @@ func TestBuildKiloCatalog(t *testing.T) {
 		t.Fatal("effort rung mapping wrong")
 	}
 }
+
+// Chat-wire tool blocks have no explicit stop frame: Finish() closes them all.
+// A map-range used to emit those BlockEnd chunks in random order, which made
+// the non-streaming tool_calls array order nondeterministic.
+func TestFinishClosesToolBlocksInCreationOrder(t *testing.T) {
+	var ends []int
+	dec := NewDecoder("chat", nil, func(c Chunk) {
+		if c.Kind == ChunkBlockEnd {
+			ends = append(ends, c.Index)
+		}
+	})
+	dec.Decode([]byte(`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"pwsh","arguments":"{}"}}]}}]}`))
+	dec.Decode([]byte(`{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"b","function":{"name":"pwsh","arguments":"{}"}}]}}]}`))
+	dec.Decode([]byte(`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`))
+	dec.Finish()
+	if len(ends) != 2 || ends[0] != 0 || ends[1] != 1 {
+		t.Fatalf("tool block ends = %v, want [0 1]", ends)
+	}
+}

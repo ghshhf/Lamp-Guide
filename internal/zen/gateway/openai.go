@@ -493,7 +493,7 @@ func servedModel(outcome lane.Outcome, requested string) string {
 // indexes renumber from 0 per request.
 type chatEmitter struct {
 	declared map[string]bool
-	toolIdx  int
+	toolIdx  int // next downstream tool_calls index, allocated at block start
 	openTool map[int]*chatToolBuf
 	sawAny   bool
 }
@@ -515,6 +515,29 @@ type chatToolBuf struct {
 	id, name   string
 	args       string
 	suppressed bool
+	outIndex   int  // stable tool_calls index handed to the client
+	announced  bool // first streaming delta already carried id/type/name
+}
+
+// openToolBlock assigns each upstream tool block its downstream index when the
+// block *opens*. Chat-wire providers keep tool blocks open until Finish(), so
+// counting completed blocks (the old approach) gave every parallel call's
+// arguments the same index 0; clients then concatenated two complete JSON
+// objects into one tool call and failed with "Unexpected non-whitespace
+// character after JSON". Allocating at start keeps the index stable even when
+// several calls' argument fragments interleave.
+func (e *chatEmitter) openToolBlock(c lane.Chunk) {
+	if e.openTool == nil {
+		e.openTool = map[int]*chatToolBuf{}
+	}
+	suppressed := isDecoy(c.Name) && !e.declared[c.Name]
+	outIndex := -1
+	if !suppressed {
+		outIndex = e.toolIdx
+		e.toolIdx++
+	}
+	e.openTool[c.Index] = &chatToolBuf{id: c.ID, name: c.Name,
+		suppressed: suppressed, outIndex: outIndex}
 }
 
 func (e *chatEmitter) hasAny() bool { return e.sawAny }
@@ -541,11 +564,7 @@ func (e *chatEmitter) consume(c lane.Chunk, text, reasoning *strings.Builder, to
 		reasoning.WriteString(c.Delta)
 	case lane.ChunkBlockStart:
 		if c.BlockType == "tool-call" {
-			if e.openTool == nil {
-				e.openTool = map[int]*chatToolBuf{}
-			}
-			e.openTool[c.Index] = &chatToolBuf{id: c.ID, name: c.Name,
-				suppressed: isDecoy(c.Name) && !e.declared[c.Name]}
+			e.openToolBlock(c)
 		}
 	case lane.ChunkToolCallDelta:
 		if e.openTool == nil {
@@ -596,40 +615,29 @@ func (e *chatEmitter) stream(c lane.Chunk) []struct{ delta map[string]any } {
 		}})
 	case lane.ChunkBlockStart:
 		if c.BlockType == "tool-call" {
-			if e.openTool == nil {
-				e.openTool = map[int]*chatToolBuf{}
-			}
-			e.openTool[c.Index] = &chatToolBuf{id: c.ID, name: c.Name,
-				suppressed: isDecoy(c.Name) && !e.declared[c.Name]}
+			e.openToolBlock(c)
 		}
 	case lane.ChunkToolCallDelta:
 		if e.openTool != nil {
-			if buf, ok := e.openTool[c.Index]; ok && !buf.suppressed {
-				delta := map[string]any{
-					"tool_calls": []any{map[string]any{
-						"index": e.toolIdx,
-						"id":    firstNonEmpty(buf.id, c.ID),
-						"function": map[string]any{
-							"name":      firstNonEmpty(buf.name, c.Name),
-							"arguments": c.Delta,
-						},
-					}},
+			if buf, ok := e.openTool[c.Index]; ok && !buf.suppressed && buf.outIndex >= 0 {
+				call := map[string]any{"index": buf.outIndex}
+				fn := map[string]any{"arguments": c.Delta}
+				if !buf.announced {
+					// OpenAI stream framing: id/type/name belong on the first
+					// fragment only; later fragments carry just the arguments.
+					call["id"] = firstNonEmpty(buf.id, c.ID)
+					call["type"] = "function"
+					fn["name"] = firstNonEmpty(buf.name, c.Name)
+					buf.announced = true
 				}
-				if buf.id != "" {
-					buf.id = ""
-				}
-				if buf.name != "" {
-					buf.name = ""
-				}
-				out = append(out, struct{ delta map[string]any }{delta})
+				call["function"] = fn
+				out = append(out, struct{ delta map[string]any }{map[string]any{
+					"tool_calls": []any{call}}})
 			}
 		}
 	case lane.ChunkBlockEnd:
 		if e.openTool != nil {
-			if _, ok := e.openTool[c.Index]; ok {
-				delete(e.openTool, c.Index)
-				e.toolIdx++
-			}
+			delete(e.openTool, c.Index)
 		}
 	}
 	return out

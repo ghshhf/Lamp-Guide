@@ -32,7 +32,7 @@ import (
 )
 
 // Version is the running build; overridable via -ldflags.
-var Version = "1.2.3"
+var Version = "1.2.4"
 
 // maxRequestBody bounds one chat/responses/messages request body. The old
 // 8MB cap rejected normal vision traffic — a handful of base64 screenshots

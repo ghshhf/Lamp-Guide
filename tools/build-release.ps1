@@ -1,5 +1,5 @@
 param(
-  [ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version = '1.2.3',
+  [ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version = '1.2.4',
   [string]$Iscc = '',
   [string]$Winres = '',
   [string]$RuntimeInstaller = ''

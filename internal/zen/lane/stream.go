@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -173,8 +174,19 @@ func (d *Decoder) endBlock(key string) {
 	}
 }
 
+// endAllBlocks closes still-open blocks in creation order. Chat-wire tool
+// blocks have no explicit stop frame, so ranging over the map used to emit
+// their BlockEnd in random order; the non-streaming path then produced
+// tool_calls in a scrambled order.
 func (d *Decoder) endAllBlocks() {
+	keys := make([]string, 0, len(d.blocks))
 	for key := range d.blocks {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		return d.blocks[keys[i]] < d.blocks[keys[j]]
+	})
+	for _, key := range keys {
 		d.endBlock(key)
 	}
 }

@@ -68,7 +68,7 @@ func inPlaceAsset(name, family string) bool {
 var FeedURL = "https://api.github.com/repos/ghshhf/Lamp-Guide/releases/latest"
 
 // Current is the running version, overridable via -ldflags.
-var Current = "1.2.3"
+var Current = "1.2.4"
 
 // ResolveFeed maps inherited defaults (the old zen-gate feed and the upstream
 // Lamp Guide feed) onto this repository's release stream without rewriting the
