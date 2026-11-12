@@ -42,7 +42,7 @@ func TestCheckAnswersWithoutFeed(t *testing.T) {
 }
 
 func TestResolveFeedSeparatesDesktopReleaseStream(t *testing.T) {
-	for _, configured := range []string{"", "  ", "https://api.github.com/repos/LAGcomcom/zen-gate/releases/latest", " https://api.github.com/repos/LAGcomcom/zen-gate/releases/latest/ "} {
+	for _, configured := range []string{"", "  ", "https://api.github.com/repos/LAGcomcom/zen-gate/releases/latest", " https://api.github.com/repos/LAGcomcom/zen-gate/releases/latest/ ", "https://api.github.com/repos/LAGcomcom/Lamp-Guide/releases/latest"} {
 		if got := ResolveFeed(configured); got != FeedURL {
 			t.Errorf("inherited feed resolved to %q, want %q", got, FeedURL)
 		}

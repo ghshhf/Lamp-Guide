@@ -62,20 +62,23 @@ func inPlaceAsset(name, family string) bool {
 }
 
 // FeedURL is the default update feed, overridable via -ldflags at release
-// build time and per-install through settings. It points at this repository's
-// own Releases API — leaving it empty made every build's update check answer
-// "already latest" without ever looking anywhere.
-var FeedURL = "https://api.github.com/repos/LAGcomcom/Lamp-Guide/releases/latest"
+// build time and per-install through settings. It points at the repository
+// that CI publishes in-place binaries to; pointing at the upstream stream
+// would only ever see Setup installers, which Apply must reject.
+var FeedURL = "https://api.github.com/repos/ghshhf/Lamp-Guide/releases/latest"
 
 // Current is the running version, overridable via -ldflags.
 var Current = "1.2.3"
 
-// ResolveFeed uses the Lamp Guide release stream for the inherited zen-gate
-// default without rewriting the shared user config. Explicit custom feeds stay
-// intact, so switching back to zen-gate does not change its update settings.
+// ResolveFeed maps inherited defaults (the old zen-gate feed and the upstream
+// Lamp Guide feed) onto this repository's release stream without rewriting the
+// shared user config. Explicit custom feeds stay intact.
 func ResolveFeed(configured string) string {
 	feed := strings.TrimSpace(configured)
-	if feed == "" || strings.TrimRight(feed, "/") == "https://api.github.com/repos/LAGcomcom/zen-gate/releases/latest" {
+	trimmed := strings.TrimRight(feed, "/")
+	if trimmed == "" ||
+		trimmed == "https://api.github.com/repos/LAGcomcom/zen-gate/releases/latest" ||
+		trimmed == "https://api.github.com/repos/LAGcomcom/Lamp-Guide/releases/latest" {
 		return FeedURL
 	}
 	return feed
