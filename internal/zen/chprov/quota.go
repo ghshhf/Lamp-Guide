@@ -96,7 +96,10 @@ func ReadQuota(ctx context.Context, id string, acct Account) Quota {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			return Fail("额度端点超时")
 		}
-		return Fail("额度请求失败：" + err.Error())
+		// http.Client errors quote the full request URL, and AuthQuery
+		// channels put accessToken= right into its query. Never surface it
+		// to the dashboard or the log.
+		return Fail("额度请求失败（网络错误，原始地址已隐藏）")
 	}
 	switch {
 	case code == http.StatusUnauthorized || code == http.StatusForbidden:
@@ -433,9 +436,12 @@ var shapeHandlers = map[string]func(Spec, Account, any) Quota{
 	// loomy：两池。每日赠送按自然日重置 ⇒ 折算成次日零点（这是**唯一**允许
 	// 用自然日口径的一家：它的报文里 dailyCycleDate 明说了「当日」）。
 	"loomy": func(_ Spec, _ Account, payload any) Quota {
-		data := flatten(payload)
-		permanent, hasPerm := numeric(data.(map[string]any)["balance"])
-		daily, hasDaily := numeric(data.(map[string]any)["dailyBalance"])
+		data, ok := flatten(payload).(map[string]any)
+		if !ok {
+			return Fail("额度响应不是对象")
+		}
+		permanent, hasPerm := numeric(data["balance"])
+		daily, hasDaily := numeric(data["dailyBalance"])
 		q := Quota{}
 		if hasDaily && daily > 0 {
 			q.Known = true

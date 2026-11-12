@@ -32,7 +32,7 @@ import (
 )
 
 // Version is the running build; overridable via -ldflags.
-var Version = "1.2.1"
+var Version = "1.2.3"
 
 // maxRequestBody bounds one chat/responses/messages request body. The old
 // 8MB cap rejected normal vision traffic — a handful of base64 screenshots
@@ -62,9 +62,12 @@ type Server struct {
 	// audits maps a live request's correlation id to its attempt tally so the
 	// per-attempt reporters (the lane callback and the relay recorder) can feed
 	// the one access line written when the response completes.
-	auditMu         sync.Mutex
-	audits          map[string]*turnAudit
-	autostart       func() bool
+	auditMu   sync.Mutex
+	audits    map[string]*turnAudit
+	autostart func() bool
+	// updateMu guards the update banner state: the background 6h check and a
+	// manual "check now" can both write it while requests read it.
+	updateMu        sync.RWMutex
 	updateAvailable bool
 	updateVersion   string
 	updateURL       string
@@ -258,9 +261,26 @@ func (s *Server) auditFor(rid string) *turnAudit {
 // SetAutostartState wires the registry-backed autostart state reader.
 func (s *Server) SetAutostartState(f func() bool) { s.autostart = f }
 
-// SetUpdateState records the latest update-check result for the banner.
+// updateSnapshot is one consistent read of the banner state.
+type updateSnapshot struct {
+	Available bool
+	Version   string
+	URL       string
+}
+
+// SetUpdateState records the latest update-check result for the banner. The
+// 6h background check and a manual "check now" can both arrive here while a
+// dashboard request reads the three fields.
 func (s *Server) SetUpdateState(available bool, version, url string) {
+	s.updateMu.Lock()
 	s.updateAvailable, s.updateVersion, s.updateURL = available, version, url
+	s.updateMu.Unlock()
+}
+
+func (s *Server) updateState() updateSnapshot {
+	s.updateMu.RLock()
+	defer s.updateMu.RUnlock()
+	return updateSnapshot{s.updateAvailable, s.updateVersion, s.updateURL}
 }
 
 // autostartState reads the registry-backed autostart toggle.

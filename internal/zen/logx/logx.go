@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -86,6 +87,10 @@ const (
 	DefaultFileLevel = "debug"
 	timeLayout       = "2006-01-02 15:04:05.000"
 	dayLayout        = "2006-01-02"
+	// maxFileBytes bounds one day's file. A high-frequency DEBUG line used to
+	// grow a single day to 130 MB, which also made the viewer's 4 MiB tail
+	// useless. Past the cap only warn/error are still recorded.
+	maxFileBytes = 32 << 20
 )
 
 type Logger struct {
@@ -101,6 +106,8 @@ type Logger struct {
 	cats     map[string]bool
 	keepDays int
 	stdout   bool
+	written  int64 // bytes written to the current daily file
+	trimNoted bool  // one-per-day "only warn/error from here" note
 }
 
 // New creates the logger; dir = <data>/logs. Old files beyond the retention
@@ -144,6 +151,10 @@ func (l *Logger) SetKeepDays(days int) {
 	l.mu.Lock()
 	l.keepDays = days
 	l.mu.Unlock()
+	// Apply the new window immediately. Sweeping only at startup meant a
+	// long-running desktop never deleted anything: a 3-day retention could
+	// leave eight daily files and ~470 MB on disk.
+	l.sweep()
 }
 
 // SetStdout mirrors lines to stdout, which is what a -no-tray run needs to be
@@ -198,6 +209,7 @@ func (l *Logger) Logf(cat, level, format string, args ...any) {
 	if len(args) > 0 {
 		msg = fmt.Sprintf(format, args...)
 	}
+	msg = redactSecrets(msg)
 	e := Entry{At: time.Now(), Level: strings.ToUpper(level), Cat: cat, Msg: msg}
 
 	l.mu2.Lock()
@@ -226,8 +238,24 @@ func (l *Logger) Logf(cat, level, format string, args ...any) {
 			return
 		}
 		l.file, l.day = f, day
+		l.written, l.trimNoted = 0, false
+		if info, statErr := f.Stat(); statErr == nil {
+			l.written = info.Size()
+		}
+		// Day rollover is the only reliable sweep point for a process that
+		// stays up for weeks. Doing it only in New() never removed anything.
+		l.sweepLocked()
 	}
-	fmt.Fprintf(l.file, "[%s] [%s] {%s} %s\n", e.At.Format(timeLayout), e.Level, cat, msg)
+	if l.written >= maxFileBytes && levelRank(level) < levelRank("warn") {
+		if !l.trimNoted {
+			l.trimNoted = true
+			fmt.Fprintf(l.file, "[%s] [WARN] {app} 单日日志已达 %d MB 上限，之后只记录 warn/error\n",
+				e.At.Format(timeLayout), maxFileBytes>>20)
+		}
+		return
+	}
+	n, _ := fmt.Fprintf(l.file, "[%s] [%s] {%s} %s\n", e.At.Format(timeLayout), e.Level, cat, msg)
+	l.written += int64(n)
 }
 
 func (l *Logger) Debugf(format string, args ...any) { l.Logf(CatApp, "debug", format, args...) }
@@ -395,37 +423,70 @@ func (l *Logger) Days() []string {
 	return days
 }
 
-// sweep removes log files beyond the retention window.
+// sweep removes log files beyond the retention window. It runs on startup,
+// whenever the retention setting changes, and on every day rollover.
 func (l *Logger) sweep() {
-	entries, err := os.ReadDir(l.dir)
-	if err != nil {
-		return
-	}
 	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.sweepLocked()
+}
+
+// sweepLocked is the sweep body; the caller holds l.mu. Logf already holds it
+// while rolling the daily file, so the sweep must not lock again there.
+func (l *Logger) sweepLocked() {
 	keep := l.keepDays
-	l.mu.Unlock()
 	if keep <= 0 {
 		keep = DefaultKeepDays
 	}
 	cutoff := time.Now().AddDate(0, 0, -keep)
-	names := []string{}
+	entries, err := os.ReadDir(l.dir)
+	if err != nil {
+		return
+	}
+	today := time.Now().Format(dayLayout)
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".log") {
 			continue
 		}
-		names = append(names, e.Name())
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		day := strings.TrimSuffix(name, ".log")
+		day := strings.TrimSuffix(e.Name(), ".log")
+		if day == today {
+			continue
+		}
 		t, err := time.ParseInLocation(dayLayout, day, time.Local)
 		if err != nil {
 			continue
 		}
 		if t.Before(cutoff) {
-			_ = os.Remove(filepath.Join(l.dir, name))
+			_ = os.Remove(filepath.Join(l.dir, e.Name()))
 		}
 	}
+}
+
+// secret patterns cover the three ways credentials reach a message:
+// query-string tokens in subscription/quota URLs, Authorization-style bearer
+// values, and the sk-… keys used by OpenAI-compatible providers. http.Client
+// errors quote the full URL, so one leaked request used to be enough.
+var (
+	secretQueryRe = regexp.MustCompile(`(?i)([?&](?:access[_-]?token|token|key|api[_-]?key|secret|sign|signature|auth|password|code)=)[^&\s"'<>]+`)
+	secretBearerRe = regexp.MustCompile(`(?i)(bearer\s+)[a-z0-9._\-+/=]{8,}`)
+	secretSKRe     = regexp.MustCompile(`(?i)\bsk-[a-z0-9_\-]{8,}`)
+	secretUserRe   = regexp.MustCompile(`(?i)(https?://)[^/\s:@]+:[^/\s@]+@`)
+)
+
+// redactSecrets is applied to every message before it reaches the ring, the
+// file or stdout, so the dashboard's live log viewer cannot show a credential
+// that the file happens to have filtered out by level.
+func redactSecrets(s string) string {
+	low := strings.ToLower(s)
+	if !strings.Contains(s, "=") && !strings.Contains(s, "://") &&
+		!strings.Contains(low, "bearer") && !strings.Contains(low, "sk-") {
+		return s
+	}
+	s = secretUserRe.ReplaceAllString(s, "${1}***@")
+	s = secretQueryRe.ReplaceAllString(s, "${1}***")
+	s = secretBearerRe.ReplaceAllString(s, "${1}***")
+	s = secretSKRe.ReplaceAllString(s, "sk-***")
+	return s
 }
 
 // Close flushes the current file.

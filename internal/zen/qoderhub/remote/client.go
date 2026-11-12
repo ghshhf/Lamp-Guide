@@ -61,6 +61,7 @@ type Config struct {
 }
 
 type Client struct {
+	baseMu           sync.RWMutex
 	poolMu           sync.Mutex
 	pool             map[string]*credentialSlot
 	activeCredential string
@@ -293,14 +294,37 @@ func cacheSuccessfulBaseURL(raw string) {
 	if err != nil {
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return
 	}
 	data, err := json.MarshalIndent(baseURLCacheFile{URL: url, UpdatedAt: time.Now().Format(time.RFC3339)}, "", "  ")
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(path, data, 0644)
+	// A direct 0644 overwrite left a readable, half-written JSON on crash or
+	// with two instances running. Stage + sync + rename, owner-only.
+	tmp, err := os.CreateTemp(filepath.Dir(path), "remote-base-url-*.tmp")
+	if err != nil {
+		return
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		return
+	}
+	_ = os.Rename(tmpName, path)
 }
 
 func baseURLCachePath() (string, error) {
@@ -338,7 +362,7 @@ func (c *Client) FetchQuota(ctx context.Context) (*Quota, error) {
 	if token == "" {
 		return nil, fmt.Errorf("no access token in credentials; re-login QoderCN/Lingma to enable quota lookup")
 	}
-	base, err := openAPIBaseURL(c.cfg.BaseURL)
+	base, err := openAPIBaseURL(c.base())
 	if err != nil {
 		return nil, err
 	}
@@ -452,7 +476,7 @@ func (c *Client) WebSearch(ctx context.Context, query string, opts WebSearchOpti
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.BaseURL+oneSearchPath+"?Encode=0", strings.NewReader(string(body)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base()+oneSearchPath+"?Encode=0", strings.NewReader(string(body)))
 	if err != nil {
 		return nil, err
 	}
@@ -500,7 +524,7 @@ func (c *Client) postEncoded(ctx context.Context, path string, body []byte) ([]b
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.BaseURL+path+"?Encode=0", strings.NewReader(string(body)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base()+path+"?Encode=0", strings.NewReader(string(body)))
 	if err != nil {
 		return nil, err
 	}
@@ -689,7 +713,7 @@ func (c *Client) postSigned(ctx context.Context, path string, body []byte) ([]by
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.BaseURL+path, strings.NewReader(string(body)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base()+path, strings.NewReader(string(body)))
 	if err != nil {
 		return nil, err
 	}
@@ -783,7 +807,7 @@ func (c *Client) Warmup(ctx context.Context) error {
 func (c *Client) ListModels(ctx context.Context) ([]Model, error) {
 	models, err := c.listModels(ctx)
 	if err == nil && c.autoBaseURL {
-		cacheSuccessfulBaseURL(c.cfg.BaseURL)
+		cacheSuccessfulBaseURL(c.base())
 	}
 	if err == nil || !c.autoBaseURL || ctx.Err() != nil {
 		return models, err
@@ -792,6 +816,22 @@ func (c *Client) ListModels(ctx context.Context) ([]Model, error) {
 }
 
 func (c *Client) listModels(ctx context.Context) ([]Model, error) {
+	return c.listModelsAt(ctx, c.base())
+}
+
+func (c *Client) base() string {
+	c.baseMu.RLock()
+	defer c.baseMu.RUnlock()
+	return c.cfg.BaseURL
+}
+
+func (c *Client) setBase(v string) {
+	c.baseMu.Lock()
+	c.cfg.BaseURL = v
+	c.baseMu.Unlock()
+}
+
+func (c *Client) listModelsAt(ctx context.Context, baseURL string) ([]Model, error) {
 	cred, err := c.loadCredential()
 	if err != nil {
 		return nil, err
@@ -800,7 +840,7 @@ func (c *Client) listModels(ctx context.Context) ([]Model, error) {
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.cfg.BaseURL+modelListPath, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+modelListPath, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -845,22 +885,23 @@ func (c *Client) listModelsWithAutoBaseURLFallback(ctx context.Context, firstErr
 	candidates := ResolveBaseURLCandidates()
 	tried := 1
 	var lastErr error
-	current := strings.TrimRight(c.cfg.BaseURL, "/")
+	current := strings.TrimRight(c.base(), "/")
 	for _, candidate := range candidates {
 		baseURL := strings.TrimRight(strings.TrimSpace(candidate.URL), "/")
 		if baseURL == "" || baseURL == current {
 			continue
 		}
 		tried++
-		previous := c.cfg.BaseURL
-		c.cfg.BaseURL = baseURL
-		models, err := c.listModels(ctx)
+		// Probe as a local parameter. Assigning c.base() while chat,
+		// quota and list requests read it raced; an early ctx return also
+		// left the client permanently pinned to the last tried hostname.
+		models, err := c.listModelsAt(ctx, baseURL)
 		if err == nil {
-			cacheSuccessfulBaseURL(c.cfg.BaseURL)
+			c.setBase(baseURL)
+			cacheSuccessfulBaseURL(baseURL)
 			return models, nil
 		}
 		lastErr = err
-		c.cfg.BaseURL = previous
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -872,7 +913,7 @@ func (c *Client) listModelsWithAutoBaseURLFallback(ctx context.Context, firstErr
 }
 
 func (c *Client) modelListStatusError(statusCode int, body string) error {
-	message := fmt.Sprintf("remote model list status %d from %s: %s", statusCode, c.cfg.BaseURL, truncate(body, 500))
+	message := fmt.Sprintf("remote model list status %d from %s: %s", statusCode, c.base(), safeBody(body, 200))
 	if statusCode == http.StatusNotFound || strings.Contains(body, "NoSuchKey") {
 		message += "。这通常表示远端 API 域名自动探测命中了错误地址，请到设置页手动填写 Lingma 官方或企业专属远端 API 域名；官方默认域名为 https://lingma.alibabacloud.com。"
 	}
@@ -897,7 +938,7 @@ func (c *Client) chatCredential(ctx context.Context, request ChatRequest, cred C
 		headers["X-Model-Key"] = key
 		headers["X-Model-Source"] = "system"
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.BaseURL+chatPath+chatQuery, strings.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base()+chatPath+chatQuery, strings.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -911,7 +952,7 @@ func (c *Client) chatCredential(ctx context.Context, request ChatRequest, cred C
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, &chatStatusError{status: resp.StatusCode, message: truncate(string(respBody), 1000)}
+		return nil, &chatStatusError{status: resp.StatusCode, message: safeBody(string(respBody), 300)}
 	}
 	var builder strings.Builder
 	var reasoningBuilder strings.Builder
@@ -2057,6 +2098,21 @@ func estimateTokens(text string) int {
 		return 0
 	}
 	return len([]rune(text)) / 4
+}
+
+// safeBody keeps an upstream error body readable without echoing the
+// credentials some endpoints put in it. chatStatusError and
+// modelListStatusError both surface their message to the dashboard.
+var (
+	sensitiveBodyKey  = regexp.MustCompile(`(?i)"([^"\\]*(?:token|secret|key|credential|authorization|cookie|signature|password)[^"\\]*)"\s*:\s*"[^"\\]*"`)
+	sensitiveURLQuery = regexp.MustCompile(`(https?://\S+)\?\S+`)
+)
+
+func safeBody(body string, max int) string {
+	s := strings.Join(strings.Fields(body), " ")
+	s = sensitiveBodyKey.ReplaceAllString(s, `"$1":"***"`)
+	s = sensitiveURLQuery.ReplaceAllString(s, "$1?***")
+	return truncate(s, max)
 }
 
 func truncate(value string, max int) string {

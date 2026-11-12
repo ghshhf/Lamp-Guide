@@ -74,9 +74,28 @@ func WriteConfig(nodes []Node) (string, error) {
 		return "", err
 	}
 	path := filepath.Join(dir, "sing-box.json")
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	// A fixed .tmp name lets two concurrent refreshes clobber each other's
+	// payload and rename a half-written file over the live config.
+	tmp, err := os.CreateTemp(dir, "sing-box-*.tmp")
+	if err != nil {
 		return "", err
 	}
-	return path, os.Rename(tmp, path)
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return "", err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return "", err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	return path, os.Rename(tmpName, path)
 }

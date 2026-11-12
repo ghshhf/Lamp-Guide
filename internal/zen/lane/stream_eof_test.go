@@ -26,6 +26,24 @@ func TestStreamReaderEOFSurvivesSniffAndUnread(t *testing.T) {
 	}
 }
 
+// bufio.ReadString returns the final unterminated line together with io.EOF.
+// Dropping it lost the terminal usage/finish frame and made the caller believe
+// the upstream never finished, triggering a pointless continuation.
+func TestReadSSEKeepsFinalUnterminatedFrame(t *testing.T) {
+	body := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}"
+	frames := 0
+	if _, err := readSSE(strings.NewReader(body), func([]byte) error {
+		frames++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if frames != 2 {
+		t.Fatalf("final unterminated data: frame was dropped, got %d frames", frames)
+	}
+}
+
 func TestStreamReaderCancellationUnblocksPendingRead(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	reader, writer := io.Pipe()

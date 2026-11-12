@@ -387,7 +387,7 @@ func PostStreamed(ctx context.Context, path string, body map[string]any, session
 	head := readUpTo(pump, 4096, 20*time.Second)
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		rest, _ := io.ReadAll(io.LimitReader(pump, 1<<20))
+		rest := drainBody(pump, 1<<20)
 		if _, ok := ctx.Value(openCodeRequestKey{}).(openCodeRequest); ok && resp.StatusCode == http.StatusPaymentRequired {
 			return nil, &UpstreamError{Code: CodeQuota, Message: "OpenCode 账号余额不足", RetryAfter: 86400, UpstreamRID: upstreamRID}
 		}
@@ -398,7 +398,7 @@ func PostStreamed(ctx context.Context, path string, body map[string]any, session
 	case "empty":
 		return nil, &UpstreamError{Code: CodeEmpty, Message: "empty response body", UpstreamRID: upstreamRID}
 	case "json", "unknown":
-		rest, _ := io.ReadAll(io.LimitReader(pump, 8<<20))
+		rest := drainBody(pump, 8<<20)
 		full := string(head) + string(rest)
 		var parsed any
 		if jerr := json.Unmarshal([]byte(full), &parsed); jerr != nil {
@@ -677,6 +677,25 @@ func (s *streamReader) readWithTimeout(p []byte, timeout time.Duration) (int, er
 	}
 }
 
+// drainBody reads up to limit bytes without waiting for EOF. The pump's idle
+// timeout is 90s, so io.ReadAll blocked the whole failover chain whenever an
+// upstream returned an error/JSON body without half-closing the connection.
+// A short per-read timeout bounds that wait (same idea as wbDrain).
+func drainBody(s *streamReader, limit int) []byte {
+	buf := make([]byte, 0, 4096)
+	tmp := make([]byte, 4096)
+	for len(buf) < limit {
+		k, err := s.ReadTimeout(tmp, 2*time.Second)
+		if k > 0 {
+			buf = append(buf, tmp[:k]...)
+		}
+		if err != nil || k == 0 {
+			break
+		}
+	}
+	return buf
+}
+
 // readSSE parses `data:` frames, dropping comments and [DONE]. Usage-bearing
 // frames are merged into the returned total (each field appears on at most a
 // couple of terminal frames, so summation matches the reference behaviour).
@@ -685,38 +704,41 @@ func readSSE(r io.Reader, onData func([]byte) error) (*Usage, error) {
 	var usage *Usage
 	for {
 		line, err := br.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				return usage, nil
-			}
+		eof := err == io.EOF
+		if err != nil && !eof {
 			return usage, err
 		}
+		// bufio.ReadString returns the final unterminated line *together with*
+		// io.EOF. Returning immediately used to discard that last data: frame,
+		// which often carries finish_reason/usage — the caller then saw no
+		// finish and started a pointless continuation/retry.
 		trimmed := strings.TrimRight(line, "\r\n")
-		if trimmed == "" || strings.HasPrefix(trimmed, ":") || !strings.HasPrefix(trimmed, "data:") {
-			continue
-		}
-		payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
-		if payload == "" {
-			continue
-		}
-		if payload == "[DONE]" {
-			return usage, nil
-		}
-		var frame map[string]any
-		if json.Unmarshal([]byte(payload), &frame) == nil {
-			if u := mapUsage(frame); u != nil {
-				if usage == nil {
-					usage = u
-				} else {
-					usage.Merge(u)
+		if trimmed != "" && !strings.HasPrefix(trimmed, ":") && strings.HasPrefix(trimmed, "data:") {
+			payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+			if payload == "[DONE]" {
+				return usage, nil
+			}
+			if payload != "" {
+				var frame map[string]any
+				if json.Unmarshal([]byte(payload), &frame) == nil {
+					if u := mapUsage(frame); u != nil {
+						if usage == nil {
+							usage = u
+						} else {
+							usage.Merge(u)
+						}
+					}
+					if _, has := frame["error"]; has {
+						return usage, ClassifyFailure(0, jsonString(frame["error"]), 0)
+					}
+				}
+				if derr := onData([]byte(payload)); derr != nil {
+					return usage, derr
 				}
 			}
-			if _, has := frame["error"]; has {
-				return usage, ClassifyFailure(0, jsonString(frame["error"]), 0)
-			}
 		}
-		if derr := onData([]byte(payload)); derr != nil {
-			return usage, derr
+		if eof {
+			return usage, nil
 		}
 	}
 }

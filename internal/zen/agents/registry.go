@@ -188,8 +188,17 @@ func (r *Registry) ResyncEnabled() int {
 	if key == r.currentKey() {
 		return 0
 	}
+	enabledCfg := r.st.Config().EnabledAgents
 	var attempted, done int
 	for _, a := range r.agents {
+		id, _, _ := a.Meta()
+		// IsEnabled() inspects files on disk, so an adapter the user has
+		// turned off in the dashboard can still look enabled because an older
+		// build left its config behind. Honour the explicit setting first;
+		// otherwise every probe round rewrites configs the user just closed.
+		if on, set := enabledCfg[id]; set && !on {
+			continue
+		}
 		if enabled, _, err := a.IsEnabled(); err != nil || !enabled {
 			continue
 		}
@@ -275,11 +284,26 @@ func homePath(rel ...string) string {
 
 // atomicWrite writes a file via temp+rename, mode 0600.
 func atomicWrite(path string, data []byte) error {
-	tmp := path + ".zengate.tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	// A fixed temp name made concurrent resyncs of two adapters race on the
+	// same file. CreateTemp gives each writer its own 0600 file.
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".zengate-*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	name := tmp.Name()
+	defer os.Remove(name)
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(name, path)
 }
 
 // processRunning checks whether any of the named executables is running via

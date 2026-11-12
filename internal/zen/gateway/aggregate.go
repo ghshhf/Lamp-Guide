@@ -12,6 +12,7 @@ import (
 	"zenui/internal/zen/aggregate"
 	"zenui/internal/zen/channels"
 	"zenui/internal/zen/lane"
+	"zenui/internal/zen/logx"
 	"zenui/internal/zen/store"
 )
 
@@ -42,6 +43,15 @@ var (
 
 const aggExpiryTTL = time.Minute
 
+// quotaFailLogAt throttles the "read failed" diagnostic. It used to fire for
+// every wired channel on every aggregate recomputation — ~760k identical
+// DEBUG lines and 90-134 MB per day — under the always-on "app" category, so
+// no user switch could silence it.
+var (
+	quotaFailLogMu sync.Mutex
+	quotaFailLogAt = map[string]time.Time{}
+)
+
 // aggChannelExpiry reads the same per-account quota cache as the account panel.
 // A failed read stays distinct from a confirmed empty balance; both are excluded
 // from the aggregate chain until a usable quota is known.
@@ -62,7 +72,21 @@ func (s *Server) aggChannelExpiry(channelID string) lane.QuotaExpiry {
 		return lane.QuotaExpiry{Never: true}
 	case q.Failed:
 		if s.logger != nil {
-			s.logger.Debugf("聚合：%s 这次读不到额度（%s）", channelID, q.Detail)
+			key := channelID + "|" + q.Detail
+			now := time.Now()
+			quotaFailLogMu.Lock()
+			if len(quotaFailLogAt) > 256 {
+				quotaFailLogAt = map[string]time.Time{}
+			}
+			last := quotaFailLogAt[key]
+			due := now.Sub(last) >= 5*time.Minute
+			if due {
+				quotaFailLogAt[key] = now
+			}
+			quotaFailLogMu.Unlock()
+			if due {
+				s.logCat(logx.CatProbe, "debug", "聚合：%s 这次读不到额度（%s）", channelID, q.Detail)
+			}
 		}
 		return lane.QuotaExpiry{Failed: true}
 	}

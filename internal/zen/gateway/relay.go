@@ -201,6 +201,15 @@ func (s *Server) relayResponses(w http.ResponseWriter, r *http.Request, req resp
 	ctx := r.Context()
 	served := p.ID + "/" + upstream
 	collector := newResponsesCollector()
+	var streamer *responsesStreamer
+	if req.Stream {
+		var e error
+		streamer, e = newResponsesStreamer(w, served)
+		if e != nil {
+			writeJSON(w, 500, openaiError(e.Error(), "internal_error"))
+			return
+		}
+	}
 	start := time.Now()
 	var firstAt int64
 	usage, finish, uerr := relay.Complete(ctx, relay.Turn{
@@ -211,16 +220,34 @@ func (s *Server) relayResponses(w http.ResponseWriter, r *http.Request, req resp
 			firstAt = time.Since(start).Milliseconds()
 		}
 		collector.consume(c)
+		if streamer != nil {
+			streamer.consume(c)
+		}
 	})
 	s.recordRelay(ctx, p, upstream, agent, finish != "", usage, firstAt, finish, uerr)
 	outcome := lane.Outcome{Usage: usage, Finish: finish, ServedModel: served}
 	if uerr != nil && !collector.hasAnything() {
+		if streamer != nil {
+			streamer.fail(uerr)
+			return
+		}
+		s.relayError(w, false, uerr)
+		return
+	}
+	if uerr != nil {
+		// Partial content followed by an upstream failure used to be replayed
+		// as a completed turn. A live stream reports it inside the stream;
+		// the buffered path still answers with a real HTTP error status.
+		if streamer != nil {
+			streamer.fail(uerr)
+			return
+		}
 		s.relayError(w, false, uerr)
 		return
 	}
 	w.Header().Set("x-zen-gate-served-by", served)
-	if req.Stream {
-		s.writeResponsesEvents(w, served, collector, outcome)
+	if streamer != nil {
+		streamer.finish(collector, outcome)
 		return
 	}
 	writeJSON(w, 200, collector.finalResponse(served, outcome, false))
@@ -296,7 +323,11 @@ func (s *Server) relayAnthropicMessages(w http.ResponseWriter, r *http.Request, 
 	case finish == lane.FinishMaxTokens || finish == "":
 		stop = "max_tokens"
 	}
-	if uerr != nil && finish == "" && !st.sawAny {
+	if uerr != nil && finish == "" {
+		// Once message_start has been flushed an HTTP error is impossible;
+		// the failure has to travel as an SSE error. The old condition also
+		// required !sawAny, so a mid-stream disconnect was swallowed and
+		// papered over with a normal message_stop / max_tokens ending.
 		if sse.flushed {
 			sse.event(map[string]any{"type": "error",
 				"error": map[string]any{"type": errorType(uerr), "message": uerr.Message}})

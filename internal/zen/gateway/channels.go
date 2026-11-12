@@ -99,6 +99,23 @@ func (s *Server) chanReadQuota(id string) chprov.Quota {
 // 只读第一条会让面板把这一家说成「3 天后作废」，而实际上 B 号还能撑很久 ——
 // 用户据此以为要充值，而问题不在那里。
 func (s *Server) chanQuotas(id string) map[string]chprov.Quota {
+	// WorkBuddy's real quota lives in the lane (token rotation +
+	// WorkBuddyExpiry), not in chprov's generic channel table. The generic
+	// reader cannot see a logged-in lane account and answers "no usable
+	// credential", which silently dropped a funded own account out of the
+	// aggregate chain and left only the free stations. qoder already took
+	// this path inside the no-accounts branch below; WorkBuddy must not wait
+	// for that branch to be reached.
+	if id == "workbuddy" {
+		q := s.cachedQuota("lane|"+id, func() chprov.Quota {
+			q, ok := s.laneQuota(id)
+			if !ok {
+				return chprov.Fail("WorkBuddy 额度读取不可用")
+			}
+			return q
+		})
+		return map[string]chprov.Quota{"lane": q}
+	}
 	accts := s.chanAccounts(id).Usable()
 	if len(accts) == 0 {
 		// workbuddy / qoder 的凭据不在 ChannelAccounts 里（它们在 lane 与 store.WorkBuddy），
@@ -141,6 +158,12 @@ func (s *Server) chanQuotas(id string) map[string]chprov.Quota {
 // 「渠道面说还剩 3 天、聚合面说还剩 20 天」在同一分钟内同时成立。
 const chanQuotaTTL = time.Minute
 
+// quotaRetryDelay is how long a failed quota read stays cached. A full
+// chanQuotaTTL used to pin one unlucky 12s timeout onto a funded account for
+// a whole minute — the "sometimes my account with credit is just ignored"
+// symptom.
+const quotaRetryDelay = 15 * time.Second
+
 // 缓存是进程级的：它只存「刚刚读到的读数」，不存凭据，也不跨进程复用。
 type quotaFlight struct {
 	done chan struct{}
@@ -170,8 +193,19 @@ func (s *Server) cachedQuota(key string, read func() chprov.Quota) chprov.Quota 
 	if s.quotaCache == nil {
 		s.quotaCache = map[string]quotaEntry{}
 	}
+	at := time.Now()
+	if q.Failed {
+		// A transient read failure (timeout, upstream 5xx, a token refresh in
+		// flight) must not make a funded account vanish from the chain. Reuse
+		// the last successful reading when there is one, and never pin a
+		// failure for the full cache window.
+		if prev, ok := s.quotaCache[key]; ok && prev.q.OK() {
+			q = prev.q
+		}
+		at = at.Add(-chanQuotaTTL + quotaRetryDelay)
+	}
 	if generation == s.quotaGeneration {
-		s.quotaCache[key] = quotaEntry{q: q, at: time.Now()}
+		s.quotaCache[key] = quotaEntry{q: q, at: at}
 	}
 	pending.q = q
 	if s.quotaPending[key] == pending {

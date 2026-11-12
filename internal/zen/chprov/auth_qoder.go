@@ -214,7 +214,13 @@ func writeQoderSidecarCredential(acct Account) error {
 	if err := os.WriteFile(tmp, body, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		// A failed rename leaves a plaintext sidecar credential (access_token,
+		// cosy_key) in a stray .tmp next to the real file.
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // ClearQoderSidecarCredential 删掉转发层自己那份凭据文件。

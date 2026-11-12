@@ -188,33 +188,21 @@ func (l *Lane) WorkBuddyExpiry(ctx context.Context) (QuotaExpiry, error) {
 	if !ok {
 		return QuotaExpiry{}, errors.New("WorkBuddy 账号未登录或已停用")
 	}
-	type result struct {
-		code int
-		body []byte
-		err  error
+	// wbGet honours ctx now (NewRequestWithContext), so cancellation really
+	// aborts the socket. The old goroutine + select only abandoned the caller
+	// while a Background-context request kept running for another 15s.
+	code, body, getErr := wbGet(ctx, wbUserResourcePath, acct)
+	if getErr != nil {
+		return QuotaExpiry{}, getErr
 	}
-	done := make(chan result, 1)
-	go func() {
-		code, body, err := wbGet(wbUserResourcePath, acct)
-		done <- result{code: code, body: body, err: err}
-	}()
-	var res result
-	select {
-	case <-ctx.Done():
-		return QuotaExpiry{}, ctx.Err()
-	case res = <-done:
-	}
-	if res.err != nil {
-		return QuotaExpiry{}, res.err
-	}
-	if res.code != 200 {
-		return QuotaExpiry{}, errors.New("积分查询返回 HTTP " + strconv.Itoa(res.code))
+	if code != 200 {
+		return QuotaExpiry{}, errors.New("积分查询返回 HTTP " + strconv.Itoa(code))
 	}
 	var payload map[string]any
-	if json.Unmarshal(res.body, &payload) != nil {
+	if json.Unmarshal(body, &payload) != nil {
 		return QuotaExpiry{}, errors.New("积分响应无法解析")
 	}
-	q := chprov.ParseQuota("workbuddy", res.body)
+	q := chprov.ParseQuota("workbuddy", body)
 	if q.Failed {
 		return QuotaExpiry{Failed: true}, errors.New(q.Detail)
 	}

@@ -371,6 +371,7 @@ func (s *Server) adminState(w http.ResponseWriter) {
 		agentsView = s.registry.Views()
 	}
 	activeAnnouncements, endedAnnouncements := s.announcementViews()
+	upd := s.updateState()
 	settings := map[string]any{
 		"defaultMaxTokens":     cfg.DefaultMaxTokens,
 		"defaultEffort":        cfg.DefaultEffort,
@@ -381,9 +382,9 @@ func (s *Server) adminState(w http.ResponseWriter) {
 		"updateFeed":           update.ResolveFeed(cfg.UpdateFeed),
 		"announcementFeed":     cfg.AnnouncementFeed,
 		"statsServerUrl":       cfg.StatsServerURL,
-		"updateAvailable":      s.updateAvailable,
-		"updateVersion":        s.updateVersion,
-		"updateURL":            s.updateURL,
+		"updateAvailable":      upd.Available,
+		"updateVersion":        upd.Version,
+		"updateURL":            upd.URL,
 		// Bundled builds cannot swap their own binary; the dashboard hides
 		// 一键更新 and just links to the release page.
 		"updateSelfUpdate":        update.SelfUpdateSupported,
@@ -1554,15 +1555,20 @@ func (s *Server) customProbeOf(id string) (lane.ProbeResult, bool) {
 // instance. Gate: an update must have been detected first, and this platform
 // must support an in-place swap.
 func (s *Server) adminUpdateApply(w http.ResponseWriter) {
-	if !s.updateAvailable || s.updateURL == "" {
+	upd := s.updateState()
+	if !upd.Available {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "没有检测到可用更新"})
+		return
+	}
+	if upd.URL == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "该版本只提供安装包（Setup），不能原地替换；请前往发布页下载安装"})
 		return
 	}
 	if !update.SelfUpdateSupported {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "此平台不支持一键更新，请从发布页下载新版本"})
 		return
 	}
-	if _, err := update.Apply(s.updateURL, lane.Client()); err != nil {
+	if _, err := update.Apply(upd.URL, lane.Client()); err != nil {
 		if s.logger != nil {
 			s.logger.Errorf("一键更新失败: %v", err)
 		}
@@ -1570,7 +1576,7 @@ func (s *Server) adminUpdateApply(w http.ResponseWriter) {
 		return
 	}
 	if s.logger != nil {
-		s.logger.Infof("一键更新完成 (v%s → %s)，重启中…", Version, s.updateVersion)
+		s.logger.Infof("一键更新完成 (v%s → %s)，重启中…", Version, upd.Version)
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "restarting": true})
 	go func() {

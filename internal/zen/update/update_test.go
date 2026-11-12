@@ -3,6 +3,8 @@ package update
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -88,5 +90,51 @@ func TestGetDoesNotRetryOtherStatuses(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("non-rate-limit statuses must not be retried, got %d requests", n)
+	}
+}
+
+func TestNewerHandlesPrereleaseAndGarbage(t *testing.T) {
+	if !Newer("1.2.10-rc1", "1.2.2") {
+		t.Fatal("a prerelease suffix must not collapse the tag to 0.0.0")
+	}
+	if Newer("1.2.2", "1.2.10-rc1") {
+		t.Fatal("an older version must not win")
+	}
+	if Newer("not-a-version", "1.2.2") {
+		t.Fatal("a malformed remote tag must never trigger an update")
+	}
+}
+
+// A release page is HTML and comfortably exceeds the 1 MiB size floor. It
+// must never be handed to Apply() as if it were the Windows binary.
+func TestParseGitHubReleaseNeverHandsOutHTMLPage(t *testing.T) {
+	data := []byte(`{"tag_name":"v1.9.0","html_url":"https://github.com/o/r/releases/tag/v1.9.0","body":"notes","assets":[]}`)
+	_, _, url, _, err := parseGitHubRelease(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if assetName() != "" && url != "" {
+		t.Fatalf("no matching asset must not fall back to the release page, got %q", url)
+	}
+	if assetName() == "" && url == "" {
+		t.Fatal("bundled platforms still need the release page link")
+	}
+}
+
+func TestLooksLikePERejectsHTMLPage(t *testing.T) {
+	dir := t.TempDir()
+	html := filepath.Join(dir, "page.html")
+	if err := os.WriteFile(html, []byte("<!DOCTYPE html><html>release page</html>"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if looksLikePE(html) {
+		t.Fatal("an HTML release page must not pass as an exe")
+	}
+	pe := filepath.Join(dir, "app.exe")
+	if err := os.WriteFile(pe, []byte("MZ\x90\x00fake-pe"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !looksLikePE(pe) {
+		t.Fatal("a real PE must pass")
 	}
 }

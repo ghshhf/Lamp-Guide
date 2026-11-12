@@ -206,8 +206,16 @@ func wbChatHeaders(base map[string]string, realm, conversationID, requestID, mes
 	for k, v := range base {
 		h[k] = v
 	}
-	for _, k := range wbChatHeaderDrop {
-		delete(h, k)
+	// workBuddyHeaders uses lowercase keys while the drop table is written in
+	// canonical HTTP form. Go maps are case-sensitive, so delete(h, k) missed
+	// every entry and the gateway's self-authored headers still went out.
+	for key := range h {
+		for _, drop := range wbChatHeaderDrop {
+			if strings.EqualFold(key, drop) {
+				delete(h, key)
+				break
+			}
+		}
 	}
 	for k, v := range wbConversationHeaders(conversationID, requestID, messageID) {
 		h[k] = v

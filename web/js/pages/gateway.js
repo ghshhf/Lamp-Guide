@@ -1088,6 +1088,10 @@ export default function createPage(ctx, options) {
     const deadline = asNumber(pick(sess, 'expiresAtMs', 0), 0) || (Date.now() + 600000);
     const interval = Math.max(1000, asNumber(pick(sess, 'intervalMs', 2000), 2000));
     const tick = async () => {
+      /* Esc / overlay close does not fire onSecondary. Without this guard the
+         poll kept running to the 10-minute deadline and could render into an
+         unmounted page. */
+      if (statusLine && !statusLine.isConnected) { polling = false; return; }
       if (!polling) return;
       if (Date.now() > deadline) {
         polling = false;
@@ -1652,7 +1656,7 @@ export default function createPage(ctx, options) {
     const res = await gw('announcements/refresh', {});
     if (!res.ok) { bad('拉取公告失败', res.error); return; }
     ok('已拉取公告', '一秒后自动刷新。');
-    setTimeout(() => { load().then(render); }, 1200);
+    setTimeout(() => { load().then(render).catch((e) => console.error(e)); }, 1200);
   }
 
   /* ------------------------------------------------------------ 面：模型 */
@@ -1955,7 +1959,7 @@ export default function createPage(ctx, options) {
     const res = await gw('reprobe', {});
     if (!res.ok) { bad('重新探测失败', res.error); return; }
     ok('已开始整轮探测', '结果会在探测进行时陆续出现，30 秒后会刷新一次。');
-    setTimeout(() => { load().then(render); }, 2000);
+    setTimeout(() => { load().then(render).catch((e) => console.error(e)); }, 2000);
   }
 
   async function retag() {
@@ -1993,7 +1997,7 @@ export default function createPage(ctx, options) {
     const res = await gw('tags/probe', { id });
     if (!res.ok) { bad('能力实测失败', res.error); return; }
     ok('能力实测已开始', '视觉 / 音频 / 文件三项会分阶段回报，点「任务记录」看进度。');
-    setTimeout(() => { load().then(render); }, 2000);
+    setTimeout(() => { load().then(render).catch((e) => console.error(e)); }, 2000);
   }
 
   async function openTasks(model, name) {
@@ -3219,14 +3223,14 @@ export default function createPage(ctx, options) {
     await load();
     render();
     ok('订阅已保存', s.enabled ? '正在抓取并启动侧车，稍后刷新看节点。' : '轮换已关闭。');
-    if (s.enabled) setTimeout(() => { load().then(render); }, 3000);
+    if (s.enabled) setTimeout(() => { load().then(render).catch((e) => console.error(e)); }, 3000);
   }
 
   async function refreshSubs() {
     const res = await gw('subs/refresh', {});
     if (!res.ok) { bad('重新抓取失败', res.error); return; }
     ok('已开始重新抓取', '抓取 → 解析 → 重启侧车 → 探测，大约十几秒。');
-    setTimeout(() => { load().then(render); }, 4000);
+    setTimeout(() => { load().then(render).catch((e) => console.error(e)); }, 4000);
   }
 
   async function pickSingBoxPath() {
@@ -3360,7 +3364,7 @@ export default function createPage(ctx, options) {
         icon: 'sync',
         title: '读取账号状态',
         desc: '登录态不在 state 里，点一次去网关拿。',
-        right: Button({ label: '读取', variant: 'subtle', onClick: () => { loadWorkBuddy().then(render); } })
+        right: Button({ label: '读取', variant: 'subtle', onClick: () => { loadWorkBuddy().then(render).catch((e) => console.error(e)); } })
       }));
     } else if (wb.error) {
       wbGroup.body.append(Card({ icon: 'warning', title: '读取失败', desc: String(wb.error) }));
@@ -3380,7 +3384,7 @@ export default function createPage(ctx, options) {
           logged
             ? Button({ label: '退出', variant: 'critical', onClick: wbLogout })
             : Button({ label: '登录', variant: 'accent', onClick: wbLogin }),
-          logged ? null : Button({ label: '刷新状态', variant: 'subtle', onClick: () => { loadWorkBuddy().then(render); } })
+          logged ? null : Button({ label: '刷新状态', variant: 'subtle', onClick: () => { loadWorkBuddy().then(render).catch((e) => console.error(e)); } })
         )
       }));
 
@@ -3407,7 +3411,7 @@ export default function createPage(ctx, options) {
         icon: 'sync',
         title: '读取 Qoder 状态',
         desc: '转发层是否在跑、有没有可用凭据、接了几个模型，都要问网关。',
-        right: Button({ label: '读取', variant: 'subtle', onClick: () => { loadQoder().then(render); } })
+        right: Button({ label: '读取', variant: 'subtle', onClick: () => { loadQoder().then(render).catch((e) => console.error(e)); } })
       }));
     } else if (q.error) {
       qGroup.body.append(Card({ icon: 'warning', title: '读取失败', desc: String(q.error) }));
@@ -3422,7 +3426,7 @@ export default function createPage(ctx, options) {
           + (pick(q, 'providerWired', false) ? '  ·  已接入网关目录' : '  ·  未接入')
           + (models.length ? '  ·  ' + models.length + ' 个模型' : ''),
         right: hrow(
-          Button({ label: '重新探测', variant: 'subtle', onClick: () => { loadQoder().then(render); } }),
+          Button({ label: '重新探测', variant: 'subtle', onClick: () => { loadQoder().then(render).catch((e) => console.error(e)); } }),
           /* 入口直接指向渠道面那一行的「登录」：这一面不重复实现登录，
              只负责把人送到真正能动手的那一处。 */
           Button({ label: '去登录', variant: 'subtle', onClick: () => {
@@ -3787,7 +3791,9 @@ export default function createPage(ctx, options) {
   });
 
   async function loadLogs() {
+    const my = ++logSeq;
     const res = await gw(logQueryString());
+    if (my !== logSeq) return;
     if (!res.ok) { bad('读取日志失败', res.error); return; }
     const d = res.data || {};
     draft.logs = Array.isArray(pick(d, 'entries', [])) ? pick(d, 'entries', []) : [];
@@ -3868,6 +3874,9 @@ export default function createPage(ctx, options) {
      落库的。这里在头几秒补几拍，让"还没探测到出口 IP"这种过渡态自己消失，
      而不是等到 30 秒的轮询或者用户手点刷新。 */
   let settleTimers = [];
+  /* A slower, earlier log query must never overwrite the newest filter's
+     result. Every load bumps the sequence; stale responses are dropped. */
+  let logSeq = 0;
   function settle() {
     for (const t of settleTimers) clearTimeout(t);
     const before = {
@@ -3884,7 +3893,7 @@ export default function createPage(ctx, options) {
         const probing = String(pick(state, 'probingModel', ''));
         const moved = ip !== before.ip || probing !== before.probing;
         if (moved && face !== 'logs') render();
-      });
+      }).catch((e) => console.error(e));
     }, ms));
   }
 
@@ -3904,9 +3913,9 @@ export default function createPage(ctx, options) {
       /* 日志面一进来就拉一次：这一面只有日志查看器，空着等于什么都没做。 */
       if (face === 'logs' && !draft.logs) loadLogs();
       /* 聚合面不等 30 秒轮询：临期是"马上要作废"的数字，晚半分钟就换了一种说法。 */
-      if (face === 'aggregate') { loadAggregate().then(render); }
+      if (face === 'aggregate') { loadAggregate().then(render).catch((e) => console.error(e)); }
       /* 渠道面一进来就读：登录态是活的，缓存一分钟就会说错「这家还没登录」。 */
-      if (face === 'channels') { loadChannels().then(render); }
+      if (face === 'channels') { loadChannels().then(render).catch((e) => console.error(e)); }
       if (face === 'agents') { loadQoder(); loadWorkBuddy(); }
       reload();
       /* 探测与出口检测都是后台跑完才落库的：首帧往往拿到的是空值，页面不刷新
@@ -3914,18 +3923,20 @@ export default function createPage(ctx, options) {
          是活的数字，所以这几面一起按 30 秒一轮跟状态走。 */
       if (autoRefresh) clearInterval(autoRefresh);
       autoRefresh = setInterval(() => {
-        if (face === 'channels' && !typing()) { loadCheckins().then(render); return; }
+        if (face === 'channels' && !typing()) { loadCheckins().then(render).catch((e) => console.error(e)); return; }
         const busy = String(pick(state, 'probingModel', '')) !== '';
         const live = face === 'models' || face === 'logs'
           || face === 'network' || face === 'service';
         /* 有输入框正被操作时不重画：replaceChildren 会把焦点和还没提交的
            字符一起丢掉，用户会觉得自己打的字被吞了。 */
-        if ((busy || live) && !typing()) load().then(render);
+        if ((busy || live) && !typing()) load().then(render).catch((e) => console.error(e));
       }, face === 'channels' ? 5000 : 30000);
     },
     onUnmount() {
       hideBar();
       if (autoRefresh) { clearInterval(autoRefresh); autoRefresh = null; }
+      for (const t of settleTimers) clearTimeout(t);
+      settleTimers = [];
     }
   };
 }

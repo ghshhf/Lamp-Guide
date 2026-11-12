@@ -126,6 +126,26 @@ func (s *Server) aggregateChainFrom(model string, cfg *store.Config, expiries ma
 	if err != nil {
 		return nil
 	}
+	// Known-bad stations go to the BACK of the chain, not out of it. Without
+	// this the expiry ranking keeps a free station that just answered
+	// "FreeUsageLimitError" in first place while a funded own account sits
+	// behind it, so every turn collides with the exhausted station first.
+	// The chain is never shortened: an empty chain hides the real problem.
+	if s.Lane != nil {
+		_, av, _ := s.Lane.Snapshot()
+		healthy := make([]aggregate.Candidate, 0, len(ordered))
+		unhealthy := make([]aggregate.Candidate, 0, len(ordered))
+		for _, c := range ordered {
+			state := lane.FreshState(av[c.RealID])
+			if state == lane.StateThrottled || state == lane.StateUnavailable ||
+				state == lane.StateRegionBlock || s.Lane.Throttled(c.RealID) {
+				unhealthy = append(unhealthy, c)
+				continue
+			}
+			healthy = append(healthy, c)
+		}
+		ordered = append(healthy, unhealthy...)
+	}
 	out := make([]aggTarget, 0, len(ordered))
 	for _, c := range ordered {
 		if t, ok := s.aggTargetOf(c); ok {

@@ -269,22 +269,39 @@ func (l *Lane) wbRestrictionCooldown() time.Duration {
 	return left
 }
 
-// refreshWorkBuddy exchanges the refresh token for a fresh pair. Single-flight
-// by construction: the whole exchange holds wbMu, and a latecomer re-checks
-// freshness before doing anything, so N concurrent 401s produce one refresh.
+// refreshWorkBuddy exchanges the refresh token for a fresh pair. Only the
+// short bookkeeping sections hold wbMu: the network round trip runs under a
+// dedicated refreshMu, so a hung upstream no longer freezes snapshots, quota
+// reads and user traffic behind 15 seconds of global lock. A failed exchange
+// gets a cooldown, otherwise N concurrent 401s each retry a dead endpoint.
 func (l *Lane) refreshWorkBuddy(ctx context.Context) error {
+	l.wbRefreshMu.Lock()
+	defer l.wbRefreshMu.Unlock()
+
 	l.wbMu.Lock()
-	defer l.wbMu.Unlock()
 	acct := l.wbAcct
+	refreshedAt := l.wbRefreshedAt
+	failedAt := l.wbRefreshFailedAt
+	l.wbMu.Unlock()
 	if acct.RefreshToken == "" {
 		return errors.New("WorkBuddy 没有 refresh token")
 	}
-	if !wbTokenNearExpiry(acct) && time.Since(l.wbRefreshedAt) < time.Minute {
+	if !wbTokenNearExpiry(acct) && time.Since(refreshedAt) < time.Minute {
 		return nil // someone just refreshed; the pair is current
 	}
+	if !failedAt.IsZero() && time.Since(failedAt) < 15*time.Second && !wbTokenNearExpiry(acct) {
+		return errors.New("WorkBuddy 刷新冷却中")
+	}
+	fail := func(err error) error {
+		l.wbMu.Lock()
+		l.wbRefreshFailedAt = time.Now()
+		l.wbMu.Unlock()
+		return err
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, WorkBuddyBase+wbAuthRefreshPath, strings.NewReader("{}"))
 	if err != nil {
-		return err
+		return fail(err)
 	}
 	req.Header.Set("content-type", "application/json")
 	req.Header.Set("user-agent", wbDesktopUAFor(acct.Realm))
@@ -294,15 +311,15 @@ func (l *Lane) refreshWorkBuddy(ctx context.Context) error {
 	client := &http.Client{Timeout: 15 * time.Second, Transport: laneHTTP.Transport}
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return fail(err)
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return err
+		return fail(err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("WorkBuddy 刷新返回 HTTP %d: %s", resp.StatusCode, truncate(string(data), 200))
+		return fail(fmt.Errorf("WorkBuddy 刷新返回 HTTP %d: %s", resp.StatusCode, truncate(string(data), 200)))
 	}
 	var payload struct {
 		Code int `json:"code"`
@@ -312,10 +329,10 @@ func (l *Lane) refreshWorkBuddy(ctx context.Context) error {
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(data, &payload); err != nil {
-		return err
+		return fail(err)
 	}
 	if payload.Code != 0 || payload.Data.AccessToken == "" {
-		return fmt.Errorf("WorkBuddy 刷新被拒（code %d）", payload.Code)
+		return fail(fmt.Errorf("WorkBuddy 刷新被拒（code %d）", payload.Code))
 	}
 	acct.AccessToken = payload.Data.AccessToken
 	if payload.Data.RefreshToken != "" {
@@ -329,9 +346,12 @@ func (l *Lane) refreshWorkBuddy(ctx context.Context) error {
 		}
 		_ = iss
 	}
+	l.wbMu.Lock()
 	l.wbAcct = acct
 	l.wbRefreshedAt = time.Now()
+	l.wbRefreshFailedAt = time.Time{}
 	l.wbPersistLocked()
+	l.wbMu.Unlock()
 	return nil
 }
 
@@ -397,7 +417,9 @@ func (l *Lane) WorkBuddyLoginPoll() (string, error) {
 		l.wbMu.Unlock()
 		return "", errors.New("登录已超时，请重新开始")
 	}
-	httpStatus, body, err := wbGet(wbAuthTokenPath+"?state="+state, WBAccount{})
+	pollCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	httpStatus, body, err := wbGet(pollCtx, wbAuthTokenPath+"?state="+state, WBAccount{})
 	if err != nil {
 		return "", err
 	}
@@ -474,7 +496,7 @@ func wbAccountFromToken(t wbTokenResponse) (WBAccount, error) {
 		acct.ExpiresAtMS = wbExpToMS(t.ExpiresAt)
 	}
 	// Best-effort nickname; its absence costs a display name only.
-	if _, body, err := wbGet(wbLoginAccountPath+"?state=", acct); err == nil {
+	if _, body, err := wbGet(context.Background(), wbLoginAccountPath+"?state=", acct); err == nil {
 		var named struct {
 			Data struct {
 				Nickname string `json:"nickname"`
@@ -490,8 +512,11 @@ func wbAccountFromToken(t wbTokenResponse) (WBAccount, error) {
 // wbGet performs one identity-bearing GET against the WorkBuddy root and
 // returns (upstream code, body) without treating non-2xx as a Go error — the
 // callers read the envelope's own codes.
-func wbGet(path string, acct WBAccount) (int, []byte, error) {
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, WorkBuddyBase+path, nil)
+func wbGet(ctx context.Context, path string, acct WBAccount) (int, []byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, WorkBuddyBase+path, nil)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -577,21 +602,10 @@ func (l *Lane) WorkBuddyCredits(ctx context.Context) (string, error) {
 	if !ok {
 		return "", errors.New("WorkBuddy 账号未登录")
 	}
-	done := make(chan struct{})
-	var (
-		outerCode int
-		body      []byte
-		getErr    error
-	)
-	go func() {
-		outerCode, body, getErr = wbGet(wbUserResourcePath, acct)
-		close(done)
-	}()
-	select {
-	case <-ctx.Done():
-		return "", ctx.Err()
-	case <-done:
-	}
+	// The old goroutine + select only abandoned the caller: wbGet used
+	// context.Background(), so cancellation left a 15s socket and a goroutine
+	// writing into escaped stack variables. wbGet now honours ctx directly.
+	outerCode, body, getErr := wbGet(ctx, wbUserResourcePath, acct)
 	if getErr != nil {
 		return "", getErr
 	}

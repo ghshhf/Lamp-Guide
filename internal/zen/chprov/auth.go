@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -185,7 +186,10 @@ func startDevice(ctx context.Context, spec Spec) (LoginSession, error) {
 		// minimax 收 form（实测它不认 JSON body）。
 		form := url.Values{}
 		for k, v := range body {
-			form.Set(k, v.(string))
+			// The device endpoint may add numeric fields (expires_in, interval).
+			// An unchecked string assertion here panicked the whole process on
+			// any non-string addition.
+			form.Set(k, fmt.Sprint(v))
 		}
 		headers["content-type"] = "application/x-www-form-urlencoded"
 		code, raw, err = HTTPPost(ctx, spec.Login.DeviceURL, headers, form.Encode())
@@ -757,13 +761,22 @@ func serveCallback(ln net.Listener, spec Spec, state string) {
 		codeTab[spec.ID+"|"+state] = code
 		codeMu.Unlock()
 		_, _ = io.WriteString(w, "授权已收到，可以关掉这个页面回到面板了。")
+		// Give the response a moment to flush, then release the port.
+		time.AfterFunc(200*time.Millisecond, func() { _ = srv.Close() })
 	})
 	srv.Handler = mux
+	// Serve() used to block for the full 10-minute TTL even after the
+	// callback arrived: each login leaked a listener and a sleep goroutine.
+	done := make(chan struct{})
 	go func() {
-		time.Sleep(loginTTL)
-		_ = srv.Close()
+		select {
+		case <-time.After(loginTTL):
+			_ = srv.Close()
+		case <-done:
+		}
 	}()
 	_ = srv.Serve(ln)
+	close(done)
 }
 
 // PollPKCE 轮一次：回调到了就换 token，没到就 pending。

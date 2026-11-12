@@ -112,19 +112,21 @@ type Lane struct {
 	// rotates the refresh token on every refresh — two overlapping refreshes
 	// void the second pair) and guards the account snapshot the request paths
 	// read.
-	wbMu           sync.Mutex
-	wbCatalogMu    sync.Mutex
-	wbCatalogKey   string
-	wbCatalogAt    time.Time
-	wbCatalogCache []ModelInfo
-	wbAcct         WBAccount
-	wbPersist      func(WBAccount)
-	wbLoginPersist func(WBAccount)
-	wbRefreshedAt  time.Time
-	wbLoginState   string
-	wbLoginAt      time.Time
-	wbPool         []*wbPoolSlot
-	wbActive       string
+	wbMu              sync.Mutex
+	wbRefreshMu       sync.Mutex
+	wbRefreshFailedAt time.Time
+	wbCatalogMu       sync.Mutex
+	wbCatalogKey      string
+	wbCatalogAt       time.Time
+	wbCatalogCache    []ModelInfo
+	wbAcct            WBAccount
+	wbPersist         func(WBAccount)
+	wbLoginPersist    func(WBAccount)
+	wbRefreshedAt     time.Time
+	wbLoginState      string
+	wbLoginAt         time.Time
+	wbPool            []*wbPoolSlot
+	wbActive          string
 	// Upstream account restriction (11140) bookkeeping: a restricted account
 	// is parked on a ladder instead of being replayed, and the strike count
 	// survives until the quarantine actually lapses.
@@ -137,6 +139,13 @@ type Lane struct {
 	nextProbeAfter  time.Time
 	quotaWallActive bool
 	probingModel    string
+
+	// notifyMu coalesces catalog/availability broadcasts. A probe round used
+	// to fire one OnChange goroutine per model, and each one re-walked the
+	// whole aggregate catalog (every channel's quota read + agent resync).
+	notifyMu      sync.Mutex
+	notifyLast    time.Time
+	notifyPending bool
 
 	// OnCall receives one record per physical upstream request.
 	OnCall func(CallRecord)
@@ -272,10 +281,11 @@ func (l *Lane) applyVerdict(model string, r ProbeResult) (ProbeResult, bool) {
 	return r, true
 }
 
-func (l *Lane) fireChange() {
-	if l.OnChange != nil {
-		go l.OnChange()
-	}
+// Throttled reports whether live traffic recently got a 429 from this model.
+// The aggregate chain uses it to push an exhausted station behind healthy
+// ones instead of making every turn collide with it first.
+func (l *Lane) Throttled(model string) bool {
+	return l.throttle.Throttled(model)
 }
 
 // ThrottleNotes snapshots the ledger for /state.
@@ -520,6 +530,17 @@ func (l *Lane) ProbeRound(ctx context.Context, manual bool) {
 			allThrottled = false
 			continue
 		}
+		// Live traffic vouched for this model recently. Re-probing it spends
+		// another upstream slot and can only publish a negative that
+		// applyVerdict would suppress anyway — a free-tier quota burned for
+		// no new information.
+		l.mu.Lock()
+		vouched := l.vouchedFor(m.ID) && FreshState(l.availability[m.ID]) == StateAvailable
+		l.mu.Unlock()
+		if vouched {
+			allThrottled = false
+			continue
+		}
 		if m.Channel == ChannelKilo {
 			l.mu.Lock()
 			prev, had := l.availability[m.ID]
@@ -665,20 +686,39 @@ func (l *Lane) probeModelFor(ctx context.Context, m ModelInfo) ProbeResult {
 
 // StartLoops runs the periodic catalog refresh + probe + egress watch until
 // ctx is cancelled.
-func (l *Lane) StartLoops(ctx context.Context, probeInterval time.Duration) {
-	if probeInterval < time.Minute {
-		probeInterval = time.Minute
-	}
+//
+// probeInterval is read on every scheduler tick instead of being frozen into a
+// ticker at boot: the dashboard's 探测间隔 setting used to be a no-op until the
+// next restart. A fixed ticker also dropped ticks whenever a round took longer
+// than the interval (a full catalog can take minutes), silently stretching the
+// real period to "interval + one round". The 30s heartbeat only decides whether
+// a round is due; ProbeRound itself still owns the backoff and the re-entrancy
+// guard.
+func (l *Lane) StartLoops(ctx context.Context, probeInterval func() time.Duration) {
+	const heartbeat = 30 * time.Second
 	go func() {
 		l.RefreshCatalog(ctx)
 		l.ProbeRound(ctx, false)
-		t := time.NewTicker(probeInterval)
+		t := time.NewTicker(heartbeat)
 		defer t.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
+				d := time.Minute
+				if probeInterval != nil {
+					if got := probeInterval(); got > d {
+						d = got
+					}
+				}
+				l.mu.Lock()
+				due := time.Since(l.lastProbeAt) >= d && time.Now().After(l.nextProbeAfter)
+				busy := l.probing.Get()
+				l.mu.Unlock()
+				if !due || busy {
+					continue
+				}
 				l.RefreshCatalog(ctx)
 				l.ProbeRound(ctx, false)
 			}
@@ -720,7 +760,19 @@ func (l *Lane) StartLoops(ctx context.Context, probeInterval time.Duration) {
 				}
 				l.mu.Unlock()
 				if changed {
-					l.ProbeRound(ctx, true)
+					// An exit change is a network event, not a user's manual
+					// "probe now": it must not punch through the quota-wall
+					// backoff (manual=true skips nextProbeAfter), and a flapping
+					// exit must not restart a full catalog round every 2 minutes.
+					l.mu.Lock()
+					ready := time.Since(l.lastProbeAt) >= 5*time.Minute &&
+						time.Now().After(l.nextProbeAfter) && !l.probing.Get()
+					l.mu.Unlock()
+					if ready {
+						l.ProbeRound(ctx, false)
+					} else {
+						l.notify()
+					}
 				}
 			}
 		}
@@ -734,10 +786,43 @@ func egressChanged(a, b Egress) bool {
 	return a.IP != b.IP || a.Country != b.Country
 }
 
-func (l *Lane) notify() {
-	if l.OnChange != nil {
-		go l.OnChange()
+// notifyMinGap bounds how often the (expensive) OnChange fan-out runs. One
+// probe round probes the whole catalog one model at a time; broadcasting on
+// every model produced hundreds of concurrent full recomputes, which is where
+// the 700k-line daily DEBUG log came from.
+const notifyMinGap = 3 * time.Second
+
+// notify coalesces a burst of state changes: first one goes out immediately,
+// the rest collapse into one trailing delivery. The dashboard still sees the
+// per-model "currently probing" updates, just at a human-readable cadence.
+func (l *Lane) notify() { l.scheduleChange(false) }
+
+func (l *Lane) fireChange() { l.scheduleChange(false) }
+
+func (l *Lane) scheduleChange(force bool) {
+	cb := l.OnChange
+	if cb == nil {
+		return
 	}
+	now := time.Now()
+	l.notifyMu.Lock()
+	if !force && !l.notifyLast.IsZero() && now.Sub(l.notifyLast) < notifyMinGap {
+		if !l.notifyPending {
+			l.notifyPending = true
+			go func() {
+				time.Sleep(notifyMinGap)
+				l.notifyMu.Lock()
+				l.notifyPending = false
+				l.notifyMu.Unlock()
+				l.scheduleChange(true)
+			}()
+		}
+		l.notifyMu.Unlock()
+		return
+	}
+	l.notifyLast = now
+	l.notifyMu.Unlock()
+	go cb()
 }
 
 // quotaEgressRetries caps the extra exits one request tries after a 429 while

@@ -391,3 +391,73 @@ func equalCats(a, b map[string]bool) bool {
 	}
 	return true
 }
+
+// Retention must apply when the setting changes, not only at process start:
+// the desktop stays up for weeks, and a startup-only sweep left 470 MB behind.
+func TestSetKeepDaysSweepsImmediately(t *testing.T) {
+	l := New(t.TempDir())
+	defer l.Close()
+	old := time.Now().AddDate(0, 0, -10).Format(dayLayout)
+	recent := time.Now().AddDate(0, 0, -1).Format(dayLayout)
+	for _, d := range []string{old, recent} {
+		if err := os.WriteFile(filepath.Join(l.dir, d+".log"), []byte("line\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	l.SetKeepDays(3)
+	if _, err := os.Stat(filepath.Join(l.dir, old+".log")); !os.IsNotExist(err) {
+		t.Fatalf("10 天前的日志没有被清理: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(l.dir, recent+".log")); err != nil {
+		t.Fatalf("保留期内的日志被误删: %v", err)
+	}
+}
+
+// Past the daily cap, low-value lines stop but warn/error must still land.
+func TestDailyCapKeepsWarnError(t *testing.T) {
+	l := New(t.TempDir())
+	defer l.Close()
+	l.SetFileLevel("debug")
+	l.Logf(CatApp, "info", "before-cap")
+	l.mu.Lock()
+	l.written = maxFileBytes
+	l.mu.Unlock()
+	l.Logf(CatApp, "debug", "dropped-debug")
+	l.Logf(CatApp, "info", "dropped-info")
+	l.Logf(CatApp, "warn", "kept-warn")
+	body := readLog(t, l)
+	if strings.Contains(body, "dropped-") {
+		t.Fatal("超过单日上限后仍在写 debug/info")
+	}
+	if !strings.Contains(body, "kept-warn") {
+		t.Fatal("超过单日上限后 warn 也丢了")
+	}
+	if !strings.Contains(body, "上限") {
+		t.Fatal("缺少截断提示，用户无法知道日志被裁剪")
+	}
+}
+
+func TestRedactSecretsHidesCredentials(t *testing.T) {
+	cases := []string{
+		`订阅刷新失败: Get "https://sub.example.com/link?token=abc123XYZ&flag=1": dial tcp`,
+		`额度请求失败: https://api.x.com/quota?accessToken=secret-value`,
+		`authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload`,
+		`key=sk-abcdefghijklmnop1234`,
+	}
+	for _, in := range cases {
+		out := redactSecrets(in)
+		for _, secret := range []string{"abc123XYZ", "secret-value", "eyJhbGciOiJIUzI1NiJ9", "sk-abcdefghijklmnop1234"} {
+			if strings.Contains(out, secret) {
+				t.Fatalf("credential survived redaction: %q", out)
+			}
+		}
+	}
+	// The live ring must be clean too, not just the level-filtered file.
+	l := New(t.TempDir())
+	defer l.Close()
+	l.Infof("订阅刷新失败: %s", "https://sub.example.com/link?token=abc123XYZ")
+	entries := l.Tail("", 10)
+	if len(entries) == 0 || strings.Contains(entries[len(entries)-1].Msg, "abc123XYZ") {
+		t.Fatal("ring entry still contains the token")
+	}
+}

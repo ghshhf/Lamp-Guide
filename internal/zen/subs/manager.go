@@ -125,6 +125,9 @@ func (m *Manager) Download(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("查询 sing-box 发布失败: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("查询 sing-box 发布失败: HTTP %d", resp.StatusCode)
+	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
 		return "", err
@@ -263,6 +266,15 @@ func (m *Manager) Refresh(ctx context.Context) error {
 	// grace covers the remaining outbounds loading.
 	go func() {
 		waitPortReady(PortBase, portDialWait)
+		// The probe intentionally runs on Background so a short HTTP request
+		// cannot cancel it, but Stop() must still prevent a death ticker
+		// resurrection with no owner left to cancel it.
+		m.mu.Lock()
+		stopped := m.stopping
+		m.mu.Unlock()
+		if stopped {
+			return
+		}
 		m.ProbeAll(context.Background())
 		m.startDeathLoop()
 	}()
@@ -286,6 +298,10 @@ const deathProbeInterval = 2 * time.Minute
 // (issue #29 defect 3) made it silently vanish while the pool stayed dead.
 func (m *Manager) startDeathLoop() {
 	m.mu.Lock()
+	if m.stopping {
+		m.mu.Unlock()
+		return
+	}
 	if m.deathCancel != nil {
 		m.deathCancel()
 	}

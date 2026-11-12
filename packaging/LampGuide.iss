@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "1.2.1"
+  #define AppVersion "1.2.3"
 #endif
 #ifndef StageDir
   #error StageDir must point to the release staging directory

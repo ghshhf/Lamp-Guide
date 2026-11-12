@@ -138,7 +138,17 @@ func Start(ctx context.Context, opts Options) (*Core, error) {
 	ln.SetWorkBuddyChannels(cfg.ChannelAccounts["workbuddy"], cfg.WorkBuddy)
 	ln.SetWorkBuddyPersist(func(a lane.WBAccount) {
 		st.Mutate(func(c *store.Config) { persistWorkBuddyAccount(c, a) })
-		_ = st.Save()
+		// Every refresh rotates the refresh token. A swallowed write error
+		// leaves the disk holding the consumed pair → silent logout next boot.
+		// Retry briefly, then make the failure loud instead of invisible.
+		var err error
+		for attempt := 0; attempt < 3; attempt++ {
+			if err = st.Save(); err == nil {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		logger.Warnf("WorkBuddy 凭据写盘失败（新 token 仅在内存中，重启会掉登录）: %v", err)
 	})
 	ln.SetWorkBuddyLoginPersist(func(a lane.WBAccount) {
 		st.Mutate(func(c *store.Config) { persistWorkBuddyLogin(c, a) })
@@ -259,7 +269,15 @@ func Start(ctx context.Context, opts Options) (*Core, error) {
 	}
 	ln.OnChange = syncEndpoints
 	gw.SetModelsSync(syncEndpoints)
-	ln.StartLoops(cctx, time.Duration(cfg.ProbeIntervalMinutes)*time.Minute)
+	// Read the interval from the live config on every scheduler tick: saving
+	// 探测间隔 in the dashboard must take effect without restarting the app.
+	ln.StartLoops(cctx, func() time.Duration {
+		mins := st.Config().ProbeIntervalMinutes
+		if mins < 1 {
+			mins = 15
+		}
+		return time.Duration(mins) * time.Minute
+	})
 	// Daily rewards use verified claim endpoints; background chat traffic is not
 	// evidence of a reward and must not be reported as a successful check-in.
 	gw.StartOpenRefLoop(cctx)
@@ -346,7 +364,11 @@ func Start(ctx context.Context, opts Options) (*Core, error) {
 		}
 		gw.SetUpdateCheck(checkUpdates)
 		go func() {
-			time.Sleep(45 * time.Second)
+			select {
+			case <-cctx.Done():
+				return
+			case <-time.After(45 * time.Second):
+			}
 			checkUpdates()
 			t := time.NewTicker(6 * time.Hour)
 			defer t.Stop()
@@ -381,7 +403,11 @@ func Start(ctx context.Context, opts Options) (*Core, error) {
 	}
 	gw.SetAnnouncementPull(pullAnnouncements)
 	go func() {
-		time.Sleep(20 * time.Second)
+		select {
+		case <-cctx.Done():
+			return
+		case <-time.After(20 * time.Second):
+		}
 		pullAnnouncements()
 		t := time.NewTicker(6 * time.Hour)
 		defer t.Stop()
@@ -421,7 +447,11 @@ func Start(ctx context.Context, opts Options) (*Core, error) {
 				resp.Body.Close()
 			}
 		}
-		time.Sleep(90 * time.Second) // let the first egress detect finish
+		select {
+		case <-cctx.Done():
+			return
+		case <-time.After(90 * time.Second): // let the first egress detect finish
+		}
 		ping()
 		pt := time.NewTicker(6 * time.Hour)
 		defer pt.Stop()

@@ -11,12 +11,14 @@ package zenbridge
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"time"
 
 	"zenui/internal/zen/gateway"
 )
@@ -47,7 +49,12 @@ func (b *Bridge) AdminRequest(path string, body any) (int, []byte, error) {
 		method = http.MethodPost
 	}
 
-	req := httptest.NewRequest(method, "http://127.0.0.1/admin/api/"+strings.TrimPrefix(path, "/"), rdr)
+	// Admin routes may reach the network (proxy-test, subs/refresh,
+	// update/check). Without a cancelable context they hang the WebView
+	// dispatcher goroutine forever after the JS side has given up.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	req := httptest.NewRequest(method, "http://127.0.0.1/admin/api/"+strings.TrimPrefix(path, "/"), rdr).WithContext(ctx)
 	// These are the two facts adminAllowed checks: a loopback Host and a
 	// loopback RemoteAddr. Nothing else about the request is special-cased.
 	req.Host = "127.0.0.1"

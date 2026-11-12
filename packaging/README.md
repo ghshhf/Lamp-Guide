@@ -1,6 +1,6 @@
 # Lamp Guide Windows 安装包
 
-当前产品版本：1.2.1。目标：Windows 10 / 11 x64，当前用户安装。
+当前产品版本：1.2.3。目标：Windows 10 / 11 x64，当前用户安装。
 
 ## 安装流程
 
@@ -20,10 +20,10 @@
 构建脚本默认从 `_refs/build-tools/` 找工具和 WebView2，也可传参数：
 
 ```powershell
-.\tools\build-release.ps1 -Version 1.2.1 -Iscc 'C:\path\ISCC.exe' -Winres 'C:\path\go-winres.exe' -RuntimeInstaller 'C:\path\MicrosoftEdgeWebView2RuntimeInstallerX64.exe'
+.\tools\build-release.ps1 -Version 1.2.3 -Iscc 'C:\path\ISCC.exe' -Winres 'C:\path\go-winres.exe' -RuntimeInstaller 'C:\path\MicrosoftEdgeWebView2RuntimeInstallerX64.exe'
 ```
 
-输出：`dist/LampGuide-Setup-1.2.1-win-x64.exe` 及 SHA-256 校验文件。
+输出：`dist/LampGuide-Setup-1.2.3-win-x64.exe` 及 SHA-256 校验文件。
 脚本仅打包 `dist/app/` 中明确列出的程序、说明、第三方声明和品牌资源，不读取用户配置。
 运行环境签名必须有效且签发给 Microsoft Corporation，否则停止构建。
 

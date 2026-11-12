@@ -526,7 +526,7 @@ var ErrNoSpec = errors.New("chprov: 该渠道没有登记额度端点")
 
 // short 把一段响应体截成可读的诊断串。
 func short(data []byte) string {
-	s := strings.TrimSpace(string(data))
+	s := scrubSecrets(strings.TrimSpace(string(data)))
 	s = strings.Join(strings.Fields(s), " ")
 	if len(s) > 160 {
 		s = s[:160] + "…"

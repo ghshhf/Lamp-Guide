@@ -100,3 +100,39 @@ func TestFoldQuotasSkipsExpiredAccount(t *testing.T) {
 		t.Fatalf("expired account masked active one: %+v", q)
 	}
 }
+
+// A funded account must not disappear from the aggregate chain because one
+// 12-second quota read timed out. The last good reading carries the turn.
+func TestCachedQuotaKeepsLastGoodReading(t *testing.T) {
+	s := &Server{}
+	good := chprov.Quota{Known: true, ExpiryMS: time.Now().Add(24 * time.Hour).UnixMilli()}
+	calls := 0
+	read := func() chprov.Quota {
+		calls++
+		if calls == 1 {
+			return good
+		}
+		return chprov.Fail("临时超时")
+	}
+	const key = "test|funded-account"
+	if got := s.cachedQuota(key, read); !got.OK() {
+		t.Fatalf("第一次读数应可用: %+v", got)
+	}
+	s.quotaMu.Lock()
+	ent := s.quotaCache[key]
+	ent.at = time.Now().Add(-2 * chanQuotaTTL)
+	s.quotaCache[key] = ent
+	s.quotaMu.Unlock()
+
+	got := s.cachedQuota(key, read)
+	if !got.OK() || got.ExpiryMS != good.ExpiryMS {
+		t.Fatalf("瞬时读失败后应沿用上次成功读数, got=%+v", got)
+	}
+	// A failure must not be pinned for the full window either.
+	s.quotaMu.Lock()
+	age := time.Since(s.quotaCache[key].at)
+	s.quotaMu.Unlock()
+	if age < chanQuotaTTL-quotaRetryDelay-2*time.Second {
+		t.Fatalf("失败读数被钉在完整缓存窗口: age=%s", age)
+	}
+}

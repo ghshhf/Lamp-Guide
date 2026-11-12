@@ -2,7 +2,6 @@ package gateway
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -802,27 +801,47 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	collector := newResponsesCollector()
+	var streamer *responsesStreamer
+	onChunk := collector.consume
+	if req.Stream {
+		var e error
+		streamer, e = newResponsesStreamer(w, model)
+		if e != nil {
+			writeJSON(w, 500, openaiError(e.Error(), "internal_error"))
+			return
+		}
+		onChunk = func(c lane.Chunk) {
+			collector.consume(c)
+			streamer.consume(c)
+		}
+	}
 	outcome, uerr := s.runTurn(ctx, model, lane.Request{
 		Model: model, Effort: effort, Messages: unified,
 		Tools: convertOpenAITools(req.Tools), MaxTokens: req.MaxOutputTokens,
 		SessionSeed: seed, TurnSeed: turn,
 		Agent: agent, Needs: needs,
-	}, collector.consume)
+	}, onChunk)
 	served := servedModel(outcome, base)
 	if uerr != nil && !collector.hasAnything() {
 		if uerr.Exhausted && s.fallbackEnabled() {
 			if usage, finish, fbServed, _, ok := s.providerFallback(ctx,
 				s.providerFallbackPicks(needs, base), unified,
-				convertOpenAITools(req.Tools), req.MaxOutputTokens, agent, collector.consume); ok {
+				convertOpenAITools(req.Tools), req.MaxOutputTokens, agent, onChunk); ok {
 				fbOutcome := lane.Outcome{Usage: usage, Finish: finish, ServedModel: fbServed}
-				w.Header().Set("x-zen-gate-served-by", fbServed)
-				if req.Stream {
-					s.writeResponsesEvents(w, fbServed, collector, fbOutcome)
+				if streamer == nil {
+					w.Header().Set("x-zen-gate-served-by", fbServed)
+				}
+				if streamer != nil {
+					streamer.finish(collector, fbOutcome)
 				} else {
 					writeJSON(w, 200, collector.finalResponse(fbServed, fbOutcome, false))
 				}
 				return
 			}
+		}
+		if streamer != nil {
+			streamer.fail(uerr)
+			return
 		}
 		setRetryAfter(w, uerr)
 		body := openaiError(uerr.Message, errorType(uerr))
@@ -832,64 +851,23 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, errorStatus(uerr), body)
 		return
 	}
-	if req.Stream {
-		s.writeResponsesEvents(w, served, collector, outcome)
-	} else {
-		writeJSON(w, 200, collector.finalResponse(served, outcome, false))
-	}
-}
-
-func (s *Server) writeResponsesEvents(w http.ResponseWriter, model string, c *responsesCollector, outcome lane.Outcome) {
-	sse, err := newSSE(w)
-	if err != nil {
-		writeJSON(w, 500, openaiError(err.Error(), "internal_error"))
+	if uerr != nil {
+		// With a live stream the 200 is already committed, so the failure
+		// must travel as an in-stream error event. The buffered path can
+		// still answer with a real HTTP error status.
+		if streamer != nil {
+			streamer.fail(uerr)
+			return
+		}
+		setRetryAfter(w, uerr)
+		writeJSON(w, errorStatus(uerr), openaiError(uerr.Message, errorType(uerr)))
 		return
 	}
-	respID := randomID("resp_")
-	sse.event(map[string]any{"type": "response.created", "response": map[string]any{
-		"id": respID, "object": "response", "status": "in_progress", "model": model}})
-	oidx := 0
-	for _, block := range c.blocks {
-		switch block.kind {
-		case "text":
-			itemID := fmt.Sprintf("msg_%d", oidx)
-			sse.event(map[string]any{"type": "response.output_item.added", "output_index": oidx,
-				"item": map[string]any{"type": "message", "role": "assistant", "id": itemID, "status": "in_progress", "content": []any{}}})
-			sse.event(map[string]any{"type": "response.output_text.delta", "output_index": oidx, "item_id": itemID, "delta": block.text})
-			sse.event(map[string]any{"type": "response.output_item.done", "output_index": oidx,
-				"item": map[string]any{"type": "message", "role": "assistant", "id": itemID, "status": "completed",
-					"content": []any{map[string]any{"type": "output_text", "text": block.text}}}})
-		case "reasoning":
-			itemID := fmt.Sprintf("rs_%d", oidx)
-			sse.event(map[string]any{"type": "response.output_item.added", "output_index": oidx,
-				"item": map[string]any{"type": "reasoning", "id": itemID, "summary": []any{}}})
-			if block.text != "" {
-				sse.event(map[string]any{"type": "response.reasoning_text.delta", "output_index": oidx, "item_id": itemID, "delta": block.text})
-			}
-			sse.event(map[string]any{"type": "response.output_item.done", "output_index": oidx,
-				"item": map[string]any{"type": "reasoning", "id": itemID, "summary": []any{}}})
-		case "tool-call":
-			itemID := fmt.Sprintf("fc_%d", oidx)
-			sse.event(map[string]any{"type": "response.output_item.added", "output_index": oidx,
-				"item": map[string]any{"type": "function_call", "id": itemID, "call_id": block.id, "name": block.name, "arguments": "", "status": "in_progress"}})
-			if block.text != "" {
-				sse.event(map[string]any{"type": "response.function_call_arguments.delta", "output_index": oidx, "item_id": itemID, "delta": block.text})
-			}
-			sse.event(map[string]any{"type": "response.output_item.done", "output_index": oidx,
-				"item": map[string]any{"type": "function_call", "id": itemID, "call_id": block.id, "name": block.name, "arguments": block.text, "status": "completed"}})
-		}
-		oidx++
+	if streamer != nil {
+		streamer.finish(collector, outcome)
+		return
 	}
-	status := "completed"
-	event := "response.completed"
-	if outcome.Finish == lane.FinishMaxTokens {
-		status = "incomplete"
-		event = "response.incomplete"
-	}
-	sse.event(map[string]any{"type": event, "response": map[string]any{
-		"id": respID, "object": "response", "status": status, "model": model,
-		"output": c.outputItems(), "usage": responsesUsage(outcome.Usage)}})
-	sse.done()
+	writeJSON(w, 200, collector.finalResponse(served, outcome, false))
 }
 
 func responsesUsage(u lane.Usage) map[string]any {

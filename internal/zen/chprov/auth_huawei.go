@@ -109,13 +109,22 @@ func serveTicketCallback(ln net.Listener, spec Spec, ticketID string) {
 		codeTab[spec.ID+"|"+ticketID] = sec
 		codeMu.Unlock()
 		_, _ = io.WriteString(w, "授权已收到，可以关掉这个页面回到面板了。")
+		// Give the response a moment to flush, then release the port.
+		time.AfterFunc(200*time.Millisecond, func() { _ = srv.Close() })
 	})
 	srv.Handler = mux
+	// Serve() used to block for the full 10-minute TTL even after the
+	// callback arrived: each login leaked a listener and a sleep goroutine.
+	done := make(chan struct{})
 	go func() {
-		time.Sleep(loginTTL)
-		_ = srv.Close()
+		select {
+		case <-time.After(loginTTL):
+			_ = srv.Close()
+		case <-done:
+		}
 	}()
 	_ = srv.Serve(ln)
+	close(done)
 }
 
 // pollTicket 轮一次票据：有 secret 就去换凭据，没有就 pending。

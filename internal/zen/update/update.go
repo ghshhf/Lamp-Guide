@@ -22,18 +22,43 @@ import (
 // dashboard links to the release page and the user installs by hand.
 var SelfUpdateSupported = runtime.GOOS == "windows"
 
-// assetName is the release asset 一键更新 expects for this platform. An empty
-// name means the platform has no in-place update, which keeps the updater from
-// ever handing a foreign binary to the swap logic.
+// assetName returns this platform's in-place update *family*. Matching is by
+// prefix, not by exact filename: this project publishes versioned assets such
+// as LampGuide-1.2.3-win-x64.exe, so the inherited exact "zen-gate.exe" could
+// never match anything and silently disabled 一键更新. An empty family means
+// the platform has no in-place update at all.
 func assetName() string {
+	if !SelfUpdateSupported {
+		return ""
+	}
 	switch runtime.GOOS {
 	case "windows":
-		return "zen-gate.exe"
+		return "LampGuide"
 	case "darwin":
-		return "zen-gate-darwin"
+		return "LampGuide-darwin"
 	default:
 		return ""
 	}
+}
+
+// inPlaceAsset reports whether an asset is a bare application binary that may
+// replace the running exe. A Setup installer is also a PE with an MZ header
+// and is far above minExeSize — without this filter the 221 MB installer the
+// project actually publishes would be renamed over the app and brick it.
+func inPlaceAsset(name, family string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	if family == "" || !strings.HasPrefix(n, strings.ToLower(family)) {
+		return false
+	}
+	if runtime.GOOS == "windows" && !strings.HasSuffix(n, ".exe") {
+		return false
+	}
+	for _, bad := range []string{"setup", "installer", "install-", "webview2", "runtime", "symbols", ".sha256", ".zip", ".msi"} {
+		if strings.Contains(n, bad) {
+			return false
+		}
+	}
+	return true
 }
 
 // FeedURL is the default update feed, overridable via -ldflags at release
@@ -43,7 +68,7 @@ func assetName() string {
 var FeedURL = "https://api.github.com/repos/LAGcomcom/Lamp-Guide/releases/latest"
 
 // Current is the running version, overridable via -ldflags.
-var Current = "1.2.1"
+var Current = "1.2.3"
 
 // ResolveFeed uses the Lamp Guide release stream for the inherited zen-gate
 // default without rewriting the shared user config. Explicit custom feeds stay
@@ -110,10 +135,14 @@ func parseGitHubRelease(data []byte) (bool, string, string, string, error) {
 	if err := json.Unmarshal(data, &rel); err != nil {
 		return false, "", "", "", err
 	}
-	url := rel.HTMLURL
+	url := ""
 	if want := assetName(); want != "" {
+		// Never fall back to the release *page*: it is HTML, comfortably
+		// larger than minExeSize, and the dashboard would otherwise feed it
+		// to Apply() as a binary. A release shipping only the Setup installer
+		// also yields no URL — the user installs it by hand instead.
 		for _, a := range rel.Assets {
-			if strings.EqualFold(a.Name, want) {
+			if inPlaceAsset(a.Name, want) {
 				url = a.BrowserDownloadURL
 				break
 			}
@@ -136,22 +165,27 @@ func LatestAssetURL(data []byte) (string, int64, error) {
 		return "", 0, fmt.Errorf("no in-place update is supported on %s", runtime.GOOS)
 	}
 	for _, a := range rel.Assets {
-		if strings.EqualFold(a.Name, want) {
+		if inPlaceAsset(a.Name, want) {
 			return a.BrowserDownloadURL, a.Size, nil
 		}
 	}
-	return "", 0, fmt.Errorf("release %s has no %s asset", rel.TagName, want)
+	return "", 0, fmt.Errorf("release %s has no in-place %s binary asset", rel.TagName, want)
 }
 
 type getJSONer interface {
 	Get(url string) ([]byte, error)
 }
 
-// Newer compares dotted versions; "1.2.10" > "1.2.9".
+// Newer compares dotted versions; "1.2.10" > "1.2.9". A malformed or
+// unparseable remote tag must never win: parseVersion used to return [0,0,0]
+// for "1.2.10-rc1" and the len(a)==0 guard was unreachable on a fixed array.
 func Newer(remote, current string) bool {
-	a := parseVersion(remote)
-	b := parseVersion(current)
-	if len(a) == 0 {
+	a, ok := parseVersion(remote)
+	if !ok {
+		return false
+	}
+	b, ok := parseVersion(current)
+	if !ok {
 		return false
 	}
 	for i := 0; i < 3; i++ {
@@ -162,18 +196,24 @@ func Newer(remote, current string) bool {
 	return false
 }
 
-func parseVersion(v string) [3]int {
+func parseVersion(v string) ([3]int, bool) {
 	var out [3]int
 	v = strings.TrimPrefix(strings.TrimSpace(v), "v")
-	parts := strings.SplitN(v, ".", 3)
-	for i := 0; i < len(parts) && i < 3; i++ {
-		n, err := strconv.Atoi(strings.TrimSpace(parts[i]))
-		if err != nil {
-			return [3]int{}
+	if i := strings.IndexAny(v, "-+"); i >= 0 {
+		v = v[:i] // "1.2.10-rc1" → "1.2.10"
+	}
+	parts := strings.Split(v, ".")
+	if len(parts) == 0 || len(parts) > 3 {
+		return out, false
+	}
+	for i, p := range parts {
+		n, err := strconv.Atoi(strings.TrimSpace(p))
+		if err != nil || n < 0 {
+			return [3]int{}, false
 		}
 		out[i] = n
 	}
-	return out
+	return out, true
 }
 
 // HTTP fetcher with a sane timeout. An optional Client (e.g. the lane's

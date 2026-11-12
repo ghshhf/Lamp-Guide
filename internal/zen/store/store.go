@@ -8,6 +8,8 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"maps"
 	"os"
 	"path/filepath"
@@ -286,6 +288,8 @@ type Store struct {
 	// Config() needs no lock.
 	cfg          atomic.Pointer[Config]
 	perfDirty    bool
+	tagsDirty    bool
+	quotaDirty   bool
 	tags         map[string]ModelTag
 	mu           sync.Mutex
 	perfFlushMu  sync.Mutex
@@ -378,11 +382,25 @@ func Open() (*Store, error) {
 		return nil, err
 	}
 	s := &Store{Home: home}
-	cfg, err := loadJSON[Config](filepath.Join(home, "config.json"))
-	if err != nil || cfg.MainKey == "" {
+	cfgPath := filepath.Join(home, "config.json")
+	cfg, err := loadJSON[Config](cfgPath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			// A present-but-unreadable config is never replaced by defaults.
+			// The old branch silently overwrote it, discarding MainKey,
+			// provider keys, channel tokens and subscription URLs.
+			return nil, fmt.Errorf("无法加载配置: %w", err)
+		}
 		def := defaultConfig()
 		cfg = &def
-		if err := writeJSON(filepath.Join(home, "config.json"), cfg); err != nil {
+		if err := writeJSON(cfgPath, cfg); err != nil {
+			return nil, err
+		}
+	} else if cfg.MainKey == "" {
+		// Repair only the missing key: the rest of the document may hold
+		// accounts the user cannot re-enter without logging in again.
+		cfg.MainKey = GenerateKey("")
+		if err := writeJSON(cfgPath, cfg); err != nil {
 			return nil, err
 		}
 	}
@@ -479,12 +497,9 @@ func Open() (*Store, error) {
 	if cfg.RoutingStrategy == "" {
 		cfg.RoutingStrategy = "catalog"
 	}
-	if cfg.SchemaVersion == 0 {
-		// first migration to the versioned schema: mature defaults
-		cfg.SchemaVersion = 1
-		cfg.CloseToTray = true
-		cfg.Notifications = true
-	}
+	// Fresh-install defaults (CloseToTray / Notifications) now live in
+	// defaultConfig(). The old `SchemaVersion == 0` branch here was dead code:
+	// the migration chain above had already raised it well past zero.
 	if cfg.ProbeIntervalMinutes <= 0 {
 		cfg.ProbeIntervalMinutes = 15
 	}
@@ -536,7 +551,7 @@ func (s *Store) SetModelTag(model string, t ModelTag) {
 		}
 	}
 	s.tags[model] = t
-	_ = writeJSON(filepath.Join(s.Home, "tags.json"), s.tags)
+	s.tagsDirty = writeJSON(filepath.Join(s.Home, "tags.json"), s.tags) != nil
 }
 
 // ModelTagOf returns one model's stored capability verdict, if any.
@@ -598,7 +613,7 @@ func (s *Store) SetQuotaNote(model string, n QuotaNote) {
 	}
 	n.Episodes = kept
 	s.quota[model] = n
-	_ = writeJSON(filepath.Join(s.Home, "quota.json"), s.quota)
+	s.quotaDirty = writeJSON(filepath.Join(s.Home, "quota.json"), s.quota) != nil
 }
 
 // SnapshotQuota copies the persisted quota notes.
@@ -621,6 +636,11 @@ func defaultConfig() Config {
 		ProbeIntervalMinutes: 15,
 		ExposeRegion:         true,
 		EnabledAgents:        map[string]bool{},
+		// The v1 "mature defaults" migration below is unreachable (an
+		// earlier step has already raised SchemaVersion past 0), so a fresh
+		// install used to ship with both of these off.
+		CloseToTray:   true,
+		Notifications: true,
 	}
 }
 
@@ -812,7 +832,18 @@ func cloneSlice[T any](s []T) []T {
 func (s *Store) Save() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return writeJSON(filepath.Join(s.Home, "config.json"), s.cfg.Load())
+	if err := writeJSON(filepath.Join(s.Home, "config.json"), s.cfg.Load()); err != nil {
+		return err
+	}
+	// A failed sidecar write used to be silently lost forever. Save() runs on
+	// every account mutation, so retry the pending ones here.
+	if s.tagsDirty {
+		s.tagsDirty = writeJSON(filepath.Join(s.Home, "tags.json"), s.tags) != nil
+	}
+	if s.quotaDirty {
+		s.quotaDirty = writeJSON(filepath.Join(s.Home, "quota.json"), s.quota) != nil
+	}
+	return nil
 }
 
 // Record folds one call into the stats.
@@ -972,9 +1003,11 @@ func loadJSON[T any](path string) (*T, error) {
 	}
 	var v T
 	if err := json.Unmarshal(data, &v); err != nil {
-		// preserve the unreadable file for forensics, like the reference store
-		_ = os.Rename(path, path+".corrupt-"+time.Now().Format("20060102150405"))
-		return nil, err
+		// Keep the damaged file exactly where it is and refuse to start.
+		// Renaming it away used to let Open() write a fresh default over the
+		// same path, silently destroying every stored credential. Aborting is
+		// recoverable by hand; overwriting is not.
+		return nil, fmt.Errorf("%s 解析失败（原件未改动，可手工恢复）: %w", path, err)
 	}
 	return &v, nil
 }
@@ -984,9 +1017,25 @@ func writeJSON(path string, v any) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	// A fixed ".tmp" name let two writers clobber each other: A writes, B
+	// overwrites, A renames, B fails. A unique name plus Sync keeps each
+	// replacement atomic even when a second instance runs concurrently.
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
